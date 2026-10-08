@@ -1,23 +1,23 @@
 from pysat.solvers import Glucose3
 
 
-def generate_variables(n):
+def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
 
-def at_most_one(clauses, variables):
+def at_most_one(clauses: list[list[int]], variables: list[int]) -> list[list[int]]:
     for i in range(0, len(variables)):
         for j in range(i + 1, len(variables)):
             clauses.append([-variables[i], -variables[j]])
     return clauses
 
 
-def exactly_one(clauses, variables):
+def exactly_one(clauses: list[list[int]], variables: list[int]) -> None:
     clauses.append(variables)
     at_most_one(clauses, variables)
 
 
-def generate_clauses(n, variables):
+def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
     clauses = []
 
     # Exactly one queen in each row
@@ -41,23 +41,22 @@ def generate_clauses(n, variables):
     return clauses
 
 
-def solve_n_queens(n):
+def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
-    print(clauses)
 
-    solver = Glucose3()
-    for clause in clauses:
-        solver.add_clause(clause)
+    with Glucose3() as solver:
+        for clause in clauses:
+            solver.add_clause(clause)
 
-    if solver.solve():
-        model = solver.get_model()
-        return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-    else:
-        return None
+        if solver.solve():
+            model = solver.get_model()
+            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
+        else:
+            return None
 
 
-def print_solution(solution):
+def print_solution(solution: list[list[int]] | None) -> None:
     if solution is None:
         print("No solution found.")
     else:
@@ -66,7 +65,8 @@ def print_solution(solution):
             print(" ".join("Q" if cell else "." for cell in row))
 
 
-n = 8
-# print(generate_clauses(n, generate_variables(n)))
-solution = solve_n_queens(n)
-print_solution(solution)
+if __name__ == "__main__":
+    n = 8
+    # print(generate_clauses(n, generate_variables(n)))
+    solution = solve_n_queens(n)
+    print_solution(solution)

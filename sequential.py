@@ -1,19 +1,21 @@
+board_size: int
+
 from pysat.solvers import Glucose3
 
-new_variables_count = 0
-def generate_variables(n):
+new_variables_count: int = 0
+def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
 
-def generate_variables(n):
+def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
-def generate_new_variables(new_variables_count, length):
-    start = n ** 2 + new_variables_count
+def generate_new_variables(new_variables_count: int, length: int) -> list[int]:
+    start = board_size ** 2 + new_variables_count
     return [i for i in range(start + 1,start + length)]
 
 
-def at_most_one(clauses, variables):
+def at_most_one(clauses: list[list[int]], variables: list[int]) -> None:
     global new_variables_count
     new_variables = generate_new_variables(new_variables_count, len(variables))
     new_variables_count += (len(variables) - 1)
@@ -24,12 +26,15 @@ def at_most_one(clauses, variables):
         clauses.append([-new_variables[i - 1], -variables[i]])
     clauses.append([-new_variables[len(variables) - 2], -variables[len(variables) - 1]])
 
-def exactly_one(clauses, variables):
+def exactly_one(clauses: list[list[int]], variables: list[int]) -> None:
     clauses.append(variables)
     at_most_one(clauses, variables)
 
 
-def generate_clauses(n, variables):
+def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
+    global board_size, new_variables_count
+    board_size = n
+    new_variables_count = 0
     clauses = []
 
     # Exactly one queen in each row
@@ -85,22 +90,22 @@ def generate_clauses(n, variables):
     return clauses
 
 
-def solve_n_queens(n):
+def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
 
-    solver = Glucose3()
-    for clause in clauses:
-        solver.add_clause(clause)
+    with Glucose3() as solver:
+        for clause in clauses:
+            solver.add_clause(clause)
 
-    if solver.solve():
-        model = solver.get_model()
-        return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-    else:
-        return None
+        if solver.solve():
+            model = solver.get_model()
+            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
+        else:
+            return None
 
 
-def print_solution(solution):
+def print_solution(solution: list[list[int]] | None) -> None:
     if solution is None:
         print("No solution found.")
     else:
@@ -108,7 +113,8 @@ def print_solution(solution):
             print(" ".join("Q" if cell else "." for cell in row))
 
 
-n = 64
-solution = solve_n_queens(n)
-print_solution(solution)
+if __name__ == "__main__":
+    n = 64
+    solution = solve_n_queens(n)
+    print_solution(solution)
 

@@ -1,34 +1,36 @@
+board_size: int
+
 import math
 
 from pysat.solvers import Glucose3
 import time
 
-new_variables_count = 0
-start_time = time.time()
-def generate_variables(n):
+new_variables_count: int = 0
+start_time: float = time.time()
+def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
 
-def generate_new_variables(start, length):
+def generate_new_variables(start: int, length: int) -> list[int]:
     return [i for i in range(start, start + length)]
 
-def generate_binary_combinations(n):
+def generate_binary_combinations(n: int) -> list[str]:
     binary_combinations = []
     for i in range(1 << n):
         binary_combinations.append(format(i, '0' + str(n) + 'b'))
     return binary_combinations
 
 
-def binary_encoding(clauses, target, new_variables):
+def binary_encoding(clauses: list[list[int]], target: int, new_variables: list[int]) -> None:
     for i in range(len(new_variables)):
         clauses.append([-target, new_variables[i]])
 
-def generate_new_variables(end, length):
+def generate_new_variables(end: int, length: int) -> list[int]:
     return [i for i in range(end + 1, end + math.ceil(math.log(length, 2)) + 1)]
 
-def binary_AMO(clauses, variables):
+def binary_AMO(clauses: list[list[int]], variables: list[int]) -> None:
     global new_variables_count
-    temp_new_variables = generate_new_variables(n ** 2 + new_variables_count, len(variables))
+    temp_new_variables = generate_new_variables(board_size ** 2 + new_variables_count, len(variables))
     new_variables_count += len(temp_new_variables)
     binary_combinations = generate_binary_combinations(len(temp_new_variables))
 
@@ -41,7 +43,7 @@ def binary_AMO(clauses, variables):
 
         binary_encoding(clauses, variables[i], temp_clause)
 
-def grouping_variables(variables, per_group):
+def grouping_variables(variables: list[int], per_group: float) -> list[list[int]]:
     groups = []
     temp_groups = []
     for i in range(len(variables)):
@@ -51,27 +53,27 @@ def grouping_variables(variables, per_group):
             temp_groups = []
     return groups
 
-def generate_commanders(start, length):
+def generate_commanders(start: int, length: int) -> list[int]:
     return [i for i in range(start, start + length)]
 
 
-def binomial_AMO(clauses, variables):
+def binomial_AMO(clauses: list[list[int]], variables: list[int]) -> list[list[int]]:
     for i in range(0, len(variables)):
         for j in range(i + 1, len(variables)):
             clauses.append([-variables[i], -variables[j]])
     return clauses
 
 
-def binomial_EO(clauses, variables):
+def binomial_EO(clauses: list[list[int]], variables: list[int]) -> None:
     clauses.append(variables)
     binomial_AMO(clauses, variables)
 
 
 
-def at_most_one(clauses, variables):
+def at_most_one(clauses: list[list[int]], variables: list[int]) -> None:
         global new_variables_count
-        groups = grouping_variables(variables, n/math.floor(math.sqrt(n)))
-        commanders = generate_commanders(n ** 2 + new_variables_count + 1, len(groups))
+        groups = grouping_variables(variables, board_size/math.floor(math.sqrt(board_size)))
+        commanders = generate_commanders(board_size ** 2 + new_variables_count + 1, len(groups))
         new_variables_count += len(groups)
         binomial_AMO(clauses, commanders)
 
@@ -84,12 +86,15 @@ def at_most_one(clauses, variables):
             for j in range(len(groups[i])):
                 clauses.append([commanders[i], -groups[i][j]])
 
-def exactly_one(clauses, variables):
+def exactly_one(clauses: list[list[int]], variables: list[int]) -> None:
     clauses.append(variables)
     at_most_one(clauses, variables)
 
 
-def generate_clauses(n, variables):
+def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
+    global board_size, new_variables_count
+    board_size = n
+    new_variables_count = 0
     clauses = []
 
     # Exactly one queen in each row
@@ -146,22 +151,22 @@ def generate_clauses(n, variables):
     return clauses
 
 
-def solve_n_queens(n):
+def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
 
-    solver = Glucose3()
-    for clause in clauses:
-        solver.add_clause(clause)
+    with Glucose3() as solver:
+        for clause in clauses:
+            solver.add_clause(clause)
 
-    if solver.solve():
-        model = solver.get_model()
-        return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-    else:
-        return None
+        if solver.solve():
+            model = solver.get_model()
+            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
+        else:
+            return None
 
 
-def print_solution(solution):
+def print_solution(solution: list[list[int]] | None) -> None:
     if solution is None:
         print("No solution found.")
     else:
@@ -169,7 +174,8 @@ def print_solution(solution):
             print(" ".join("Q" if cell else "." for cell in row))
 
 
-n = 128
-solution = solve_n_queens(n)
-#print_solution(solution)
-print("Run time:  %s seconds" % (time.time() - start_time))
+if __name__ == "__main__":
+    n = 128
+    solution = solve_n_queens(n)
+    #print_solution(solution)
+    print("Run time:  %s seconds" % (time.time() - start_time))

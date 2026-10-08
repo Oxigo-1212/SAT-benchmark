@@ -1,28 +1,30 @@
+board_size: int
+
 from pysat.solvers import Glucose3
 import math
 
 
-def generate_variables(n):
+def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
 
-def binary_encoding(clauses, target, new_variables):
+def binary_encoding(clauses: list[list[int]], target: int, new_variables: list[int]) -> None:
     for i in range(len(new_variables)):
         clauses.append([-target, new_variables[i]])
 
 
-def generate_binary_combinations(n):
+def generate_binary_combinations(n: int) -> list[str]:
     binary_combinations = []
     for i in range(1 << n):
         binary_combinations.append(format(i, '0' + str(n) + 'b'))
     return binary_combinations
 
-def generate_new_variables(end, length):
+def generate_new_variables(end: int, length: int) -> list[int]:
     return [i for i in range(end + 1, end + math.ceil(math.log(length, 2)) + 1)]
 
 
-def at_most_one(clauses, new_variables, variables):
-    temp_new_variables = generate_new_variables(n ** 2 + len(new_variables), len(variables))
+def at_most_one(clauses: list[list[int]], new_variables: list[int], variables: list[int]) -> None:
+    temp_new_variables = generate_new_variables(board_size ** 2 + len(new_variables), len(variables))
     new_variables += temp_new_variables
     binary_combinations = generate_binary_combinations(len(temp_new_variables))
 
@@ -36,12 +38,14 @@ def at_most_one(clauses, new_variables, variables):
         binary_encoding(clauses, variables[i], temp_clause)
 
 
-def exactly_one(clauses, new_variables, variables):
+def exactly_one(clauses: list[list[int]], new_variables: list[int], variables: list[int]) -> None:
     clauses.append(variables)
     at_most_one(clauses, new_variables, variables)
 
 
-def generate_clauses(n, variables):
+def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
+    global board_size
+    board_size = n
     clauses = []
     new_variables = []
 
@@ -98,22 +102,22 @@ def generate_clauses(n, variables):
     return clauses
 
 
-def solve_n_queens(n):
+def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
 
-    solver = Glucose3()
-    for clause in clauses:
-        solver.add_clause(clause)
+    with Glucose3() as solver:
+        for clause in clauses:
+            solver.add_clause(clause)
 
-    if solver.solve():
-        model = solver.get_model()
-        return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-    else:
-        return None
+        if solver.solve():
+            model = solver.get_model()
+            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
+        else:
+            return None
 
 
-def print_solution(solution):
+def print_solution(solution: list[list[int]] | None) -> None:
     if solution is None:
         print("No solution found.")
     else:
@@ -121,7 +125,8 @@ def print_solution(solution):
             print(" ".join("Q" if cell else "." for cell in row))
 
 
-n = 512
-solution = solve_n_queens(n)
-print_solution(solution)
+if __name__ == "__main__":
+    n = 512
+    solution = solve_n_queens(n)
+    print_solution(solution)
 
