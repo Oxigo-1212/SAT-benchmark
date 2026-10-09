@@ -1,4 +1,4 @@
-import product
+from encoder import product
 
 board_sizes: list[int] = [4, 8, 16, 32, 64, 128, 256, 512]
 

@@ -2,11 +2,10 @@ board_size: int
 
 from pysat.solvers import Glucose3
 
+from solver.pySAT.Glucose import Glucose
+from solver.solver_interface import decode_board
+
 new_variables_count: int = 0
-def generate_variables(n: int) -> list[list[int]]:
-    return [[i * n + j + 1 for j in range(n)] for i in range(n)]
-
-
 def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
 
@@ -94,15 +93,9 @@ def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
 
-    with Glucose3() as solver:
-        for clause in clauses:
-            solver.add_clause(clause)
-
-        if solver.solve():
-            model = solver.get_model()
-            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-        else:
-            return None
+    with Glucose3(bootstrap_with=clauses) as glucose:
+        model = Glucose(glucose).solve()
+        return None if model is None else decode_board(model, n)
 
 
 def print_solution(solution: list[list[int]] | None) -> None:

@@ -7,12 +7,17 @@ import importlib
 import json
 import platform
 import resource
+import signal
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+
+from pysat.solvers import Glucose3
+
+from solver.pySAT.Glucose import Glucose
 
 ENCODINGS: tuple[str, ...] = ("binomial", "binary", "commander", "product", "sequential")
 FIELDS: tuple[str, ...] = (
@@ -40,7 +45,7 @@ def emit(data: dict[str, Any]) -> None:
 def worker(encoding: str, n: int, memory_mib: int) -> None:
     limit = memory_mib * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    module = importlib.import_module(encoding)
+    module = importlib.import_module(f"encoder.{encoding}")
     result: dict[str, Any] = {"encoding": encoding, "n": n, "phase": "generation"}
     started = time.perf_counter()
     emit(result)
@@ -51,19 +56,19 @@ def worker(encoding: str, n: int, memory_mib: int) -> None:
                       clauses=len(clauses), phase="loading")
         emit(result)
         loading = time.perf_counter()
-        with module.Glucose3() as solver:
+        with Glucose3() as glucose:
+            solver = Glucose(glucose)
             for clause in clauses:
                 solver.add_clause(clause)
             result.update(loading_s=time.perf_counter() - loading,
-                          variables=solver.nof_vars(), phase="solving")
+                          variables=solver.glucose.nof_vars(), phase="solving")
             emit(result)
             solving = time.perf_counter()
-            sat = solver.solve()
+            model = solver.solve()
             result.update(solving_s=time.perf_counter() - solving,
                           total_s=time.perf_counter() - started)
-            result.update(solver.accum_stats())
-            if sat:
-                model = solver.get_model()
+            result.update(solver.glucose.accum_stats() or {})
+            if model is not None:
                 queens = [lit - 1 for lit in model if 0 < lit <= n * n]
                 rows = [position // n for position in queens]
                 columns = [position % n for position in sorted(queens)]
@@ -85,22 +90,32 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int) -> dict[s
     command = [sys.executable, str(Path(__file__).resolve()), "--worker",
                encoding, str(n), str(memory_mib)]
     started = time.perf_counter()
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True)
     result: dict[str, Any] = {"encoding": encoding, "n": n}
     timed_out = False
+    process = None
+    # Defer Ctrl+C until the worker exists and can be cleaned up.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
-        output, errors = process.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         try:
-            for line in Path(f"/proc/{process.pid}/status").read_text().splitlines():
-                if line.startswith("VmHWM:"):
-                    result["peak_rss_mib"] = int(line.split()[1]) / 1024
-        except FileNotFoundError:
-            pass
-        process.kill()
-        output, errors = process.communicate()
+            output, errors = process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                for line in Path(f"/proc/{process.pid}/status").read_text().splitlines():
+                    if line.startswith("VmHWM:"):
+                        result["peak_rss_mib"] = int(line.split()[1]) / 1024
+            except FileNotFoundError:
+                pass
+            process.kill()
+            output, errors = process.communicate()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     for line in output.splitlines():
         result.update(json.loads(line))
     result["wall_s"] = time.perf_counter() - started
@@ -130,7 +145,7 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
         "Timings are wall-clock seconds; there are no warmups or statistical repeats. "
         "Generation includes board variables and the full Python clause list. "
         "Loading uses the original clause-by-clause insertion. Total covers generation, "
-        "loading and solve, excluding imports, model extraction, validation, and teardown. "
+        "loading and solve (including model extraction), excluding imports, validation, and teardown. "
         "Wall includes the entire worker process. Peak RSS is measured on Linux.", "",
         f"Limits: {metadata['timeout_s']:g} seconds wall time and "
         f"{metadata['memory_mib']} MiB virtual address space per case. "
@@ -145,9 +160,7 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
     ]
     encodings = metadata["encodings"]
     if metadata.get("stop_reason"):
-        lines += ["Stopped at the user's request. 512×512 and 1024×1024 were "
-                  "not run; the active sequential 256×256 case was interrupted "
-                  "without a completed measurement.", ""]
+        lines += [f"Stopped: {metadata['stop_reason']}. Remaining cases were not run.", ""]
     lines += ["## Comparison", "", "Cells show generation + loading + solving "
               "seconds for validated SAT results, or the stopping condition.", "",
               "| N | " + " | ".join(encodings) + " |",
@@ -168,7 +181,8 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
               "| Encoding | N | Status | Generation (s) | Loading (s) | Solve (s) | Total (s) | Peak RSS (MiB) | Clauses |",
               "|---|---:|---|---:|---:|---:|---:|---:|---:|"]
     for row in results:
-        timing = lambda key: f"{row[key]:.4f}" if key in row else "—"
+        def timing(key: str, measurement: dict[str, Any] = row) -> str:
+            return f"{measurement[key]:.4f}" if key in measurement else "—"
         lines.append(f"| {row['encoding']} | {row['n']} | {row['status']} | "
                      f"{timing('generation_s')} | {timing('loading_s')} | "
                      f"{timing('solving_s')} | {timing('total_s')} | "
@@ -202,20 +216,35 @@ def main() -> None:
         "platform": platform.platform(), "cpu": cpu, "solver": "Glucose3",
         "timeout_s": args.timeout, "memory_mib": args.memory_mib,
         "sizes": args.sizes, "encodings": list(args.encodings), "repeats": 1,
-        "source_sha256": {name: hashlib.sha256(Path(__file__).with_name(
-            name + ".py").read_bytes()).hexdigest() for name in args.encodings},
+        "source_sha256": {name: hashlib.sha256((Path(__file__).resolve().parent /
+            (name + ".py")).read_bytes()).hexdigest() for name in [
+                *(f"encoder/{name}" for name in args.encodings),
+                "solver/pySAT/Glucose", "solver/solver_interface", "benchmark"]},
     }
     results: list[dict[str, Any]] = []
-    for n in args.sizes:
-        for encoding in args.encodings:
-            print(f"Running {encoding:10s} N={n} ...", flush=True)
-            row = run_case(encoding, n, args.timeout, args.memory_mib)
-            results.append(row)
-            save_results(args.output, metadata, results)
-            write_report(args.output, metadata, results)
-            print(f"  {row['status']}: wall={row['wall_s']:.3f}s, "
-                  f"peak RSS={row.get('peak_rss_mib', 0):.1f} MiB, "
-                  f"phase={row.get('phase', 'startup')}", flush=True)
+    active_case: dict[str, Any] | None = None
+    try:
+        for n in args.sizes:
+            for encoding in args.encodings:
+                print(f"Running {encoding:10s} N={n} ...", flush=True)
+                active_case = {"encoding": encoding, "n": n}
+                row = run_case(encoding, n, args.timeout, args.memory_mib)
+                results.append(row)
+                active_case = None
+                save_results(args.output, metadata, results)
+                write_report(args.output, metadata, results)
+                print(f"  {row['status']}: wall={row['wall_s']:.3f}s, "
+                      f"peak RSS={row.get('peak_rss_mib', 0):.1f} MiB, "
+                      f"phase={row.get('phase', 'startup')}", flush=True)
+    except KeyboardInterrupt:
+        metadata["stop_reason"] = "Cancelled with Ctrl+C"
+        if active_case is not None:
+            metadata["interrupted_case"] = active_case
+        save_results(args.output, metadata, results)
+        write_report(args.output, metadata, results)
+        print(f"\nCancelled. Saved {len(results)} completed cases to {args.output.resolve()}",
+              flush=True)
+        sys.exit(130)
     print(f"Saved {len(results)} cases to {args.output.resolve()}", flush=True)
     if any(row["status"] in ("invalid", "error") for row in results):
         sys.exit(1)

@@ -1,29 +1,17 @@
 board_size: int
 
 import math
+
 from pysat.solvers import Glucose3
+
+from solver.pySAT.Glucose import Glucose
+from solver.solver_interface import decode_board
 import time
 
-start_time: float = time.time()
 new_variables_count: int = 0
-
+start_time: float = time.time()
 def generate_variables(n: int) -> list[list[int]]:
     return [[i * n + j + 1 for j in range(n)] for i in range(n)]
-
-
-def binomial_AMO(clauses: list[list[int]], variables: list[int]) -> list[list[int]]:
-    for i in range(0, len(variables)):
-        for j in range(i + 1, len(variables)):
-            clauses.append([-variables[i], -variables[j]])
-    return clauses
-
-def generate_matrix(start: int, variables_length: int) -> list[list[int]]:
-    p = math.ceil(math.sqrt(variables_length))
-    q = math.ceil(board_size / p)
-    return [
-        [i for i in range(start, start + p)],
-        [j for j in range(start + p, start + p + q)]
-    ]
 
 
 def generate_binary_combinations(n: int) -> list[str]:
@@ -55,32 +43,53 @@ def binary_AMO(clauses: list[list[int]], variables: list[int]) -> None:
 
         binary_encoding(clauses, variables[i], temp_clause)
 
+def grouping_variables(variables: list[int], per_group: float) -> list[list[int]]:
+    groups = []
+    temp_groups = []
+    for i in range(len(variables)):
+        temp_groups.append(variables[i])
+        if((i + 1) % per_group == 0 or i == len(variables) - 1):
+            groups.append(temp_groups)
+            temp_groups = []
+    return groups
+
+def generate_commanders(start: int, length: int) -> list[int]:
+    return [i for i in range(start, start + length)]
+
+
+def binomial_AMO(clauses: list[list[int]], variables: list[int]) -> list[list[int]]:
+    for i in range(0, len(variables)):
+        for j in range(i + 1, len(variables)):
+            clauses.append([-variables[i], -variables[j]])
+    return clauses
+
+
+def binomial_EO(clauses: list[list[int]], variables: list[int]) -> None:
+    clauses.append(variables)
+    binomial_AMO(clauses, variables)
+
+
+
 def at_most_one(clauses: list[list[int]], variables: list[int]) -> None:
-    global new_variables_count
-    matrix = generate_matrix(board_size ** 2 + new_variables_count + 1, len(variables))
-    row = matrix[0]
-    col = matrix[1]
-    new_variables_count += len(row) + len(col)
+        global new_variables_count
+        groups = grouping_variables(variables, board_size/math.floor(math.sqrt(board_size)))
+        commanders = generate_commanders(board_size ** 2 + new_variables_count + 1, len(groups))
+        new_variables_count += len(groups)
+        binomial_AMO(clauses, commanders)
 
-    if(len(variables) > 10):
-        binary_AMO(clauses, row)
-        binary_AMO(clauses, col)
-    else:
-        binomial_AMO(clauses, row)
-        binomial_AMO(clauses, col)
-
-    x = 0
-    for i in range(len(row)):
-        for j in range(len(col)):
-            clauses.append([-variables[x], row[i]])
-            clauses.append([-variables[x], col[j]])
-            x += 1
-            if x == len(variables): break
-        if x == len(variables): break
+        for i in range(len(commanders)):
+            if len(groups[i]) > 4:
+                binary_AMO(clauses, groups[i])
+            else:
+                binomial_AMO(clauses, groups[i])
+            clauses.append(groups[i] + [-commanders[i]])
+            for j in range(len(groups[i])):
+                clauses.append([commanders[i], -groups[i][j]])
 
 def exactly_one(clauses: list[list[int]], variables: list[int]) -> None:
     clauses.append(variables)
     at_most_one(clauses, variables)
+
 
 def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
     global board_size, new_variables_count
@@ -95,6 +104,7 @@ def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
     # Exactly one queen in each column
     for col in range(n):
         exactly_one(clauses, [variables[row][col] for row in range(n)])
+
 
     # At most one queen in each diagonal
     for i in range(1, n):
@@ -127,6 +137,7 @@ def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
             col += 1
         at_most_one(clauses, diagonal)
 
+
     for j in range(1, n - 1):
         diagonal = []
         row = 0
@@ -144,15 +155,9 @@ def solve_n_queens(n: int) -> list[list[int]] | None:
     variables = generate_variables(n)
     clauses = generate_clauses(n, variables)
 
-    with Glucose3() as solver:
-        for clause in clauses:
-            solver.add_clause(clause)
-
-        if solver.solve():
-            model = solver.get_model()
-            return [[int(model[i * n + j] > 0) for j in range(n)] for i in range(n)]
-        else:
-            return None
+    with Glucose3(bootstrap_with=clauses) as glucose:
+        model = Glucose(glucose).solve()
+        return None if model is None else decode_board(model, n)
 
 
 def print_solution(solution: list[list[int]] | None) -> None:
@@ -166,5 +171,5 @@ def print_solution(solution: list[list[int]] | None) -> None:
 if __name__ == "__main__":
     n = 128
     solution = solve_n_queens(n)
-    print_solution(solution)
+    #print_solution(solution)
     print("Run time:  %s seconds" % (time.time() - start_time))
