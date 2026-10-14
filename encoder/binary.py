@@ -27,6 +27,8 @@ def generate_new_variables(end: int, length: int) -> list[int]:
 
 
 def at_most_one(clauses: list[list[int]], new_variables: list[int], variables: list[int]) -> None:
+    if len(variables) < 2:
+        return
     temp_new_variables = generate_new_variables(board_size ** 2 + len(new_variables), len(variables))
     new_variables += temp_new_variables
     binary_combinations = generate_binary_combinations(len(temp_new_variables))

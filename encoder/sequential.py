@@ -15,6 +15,8 @@ def generate_new_variables(new_variables_count: int, length: int) -> list[int]:
 
 
 def at_most_one(clauses: list[list[int]], variables: list[int]) -> None:
+    if len(variables) < 2:
+        return
     global new_variables_count
     new_variables = generate_new_variables(new_variables_count, len(variables))
     new_variables_count += (len(variables) - 1)
