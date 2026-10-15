@@ -2,17 +2,20 @@
 
 from collections import deque
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+import argparse
 import curses
 import math
+from pathlib import Path
 import sys
 import textwrap
+import traceback
 from threading import Event
 
-from benchmark import ENCODINGS, SAT_SOLVERS, SOLVERS, run_case
+from benchmark import ENCODINGS, MODEL_ENCODINGS, SAT_SOLVERS, SOLVERS, case_encodings, run_case
 
 
 def build_cases(fields, solvers, encoders):
-    """Validate the form and expand only SAT solvers across selected encoders."""
+    """Validate the form and select CNF encodings or compatible native models."""
     try:
         sizes = list(dict.fromkeys(map(int, fields[0].split())))
         timeout = float(fields[1])
@@ -23,17 +26,19 @@ def build_cases(fields, solvers, encoders):
         raise ValueError("N and limits must be positive; timeout must be finite.")
     if not solvers:
         raise ValueError("Select at least one solver.")
-    if any(solver in SAT_SOLVERS for solver in solvers) and not encoders:
+    if not encoders:
+        raise ValueError("Select at least one encoder or native model.")
+    if any(solver in SAT_SOLVERS for solver in solvers) and not set(ENCODINGS) & encoders:
         raise ValueError("Select at least one encoder for SAT solvers.")
     cases = [(encoding, n, solver) for n in sizes for solver in SOLVERS if solver in solvers
-             for encoding in (tuple(name for name in ENCODINGS if name in encoders)
-                              if solver in SAT_SOLVERS else ("native",))]
+             for encoding in case_encodings(solver, [name for name in MODEL_ENCODINGS if name in encoders])]
     return cases, timeout, memory
 
 
 class NQueensTUI:
-    def __init__(self, screen):
+    def __init__(self, screen, log_dir=None):
         self.screen = screen
+        self.log_dir = log_dir
         self.fields = ["8", "30", "3072"]
         self.solvers = {"glucose"}
         self.encoders = {"binomial"}
@@ -89,7 +94,8 @@ class NQueensTUI:
         if self.future is None and self.pending:
             self.current = self.pending.popleft()
             encoding, n, solver = self.current
-            self.future = pool.submit(run_case, encoding, n, self.timeout, self.memory, solver, self.cancel)
+            self.future = pool.submit(run_case, encoding, n, self.timeout, self.memory, solver, self.cancel,
+                                      **({"log_dir": self.log_dir} if self.log_dir is not None else {}))
 
     def handle_key(self, key):
         if key in (ord("q"), 27):
@@ -106,7 +112,7 @@ class NQueensTUI:
         elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
             self.scroll = max(0, self.scroll + (5 if key == curses.KEY_NPAGE else -5))
         elif not self.busy:
-            last = 3 + len(SOLVERS) + len(ENCODINGS)
+            last = 3 + len(SOLVERS) + len(MODEL_ENCODINGS)
             if key in (9, curses.KEY_DOWN, curses.KEY_BTAB, curses.KEY_UP):
                 step = -1 if key in (curses.KEY_BTAB, curses.KEY_UP) else 1
                 self.focus = (self.focus + step) % (last + 1)
@@ -125,11 +131,8 @@ class NQueensTUI:
                     name = SOLVERS[self.focus - 3]
                     self.solvers.symmetric_difference_update({name})
                 elif self.focus < last:
-                    if any(solver in SAT_SOLVERS for solver in self.solvers):
-                        name = ENCODINGS[self.focus - 3 - len(SOLVERS)]
-                        self.encoders.symmetric_difference_update({name})
-                    else:
-                        self.message = "Native solvers use direct models; encoders are inactive."
+                    name = MODEL_ENCODINGS[self.focus - 3 - len(SOLVERS)]
+                    self.encoders.symmetric_difference_update({name})
         return True
 
     def put(self, y, x, text, style=0, width=None):
@@ -149,6 +152,8 @@ class NQueensTUI:
                  result["status"].upper()]
         if "wall_s" in result:
             lines.append(f"Wall time: {result['wall_s']:.3f}s")
+        if result.get("log_dir"):
+            lines += textwrap.wrap(f"Logs: {result['log_dir']}", width)
         if result["status"] == "sat":
             columns = result["queen_columns_1based"]
             lines += ["", "Queen columns by row (1-based):"]
@@ -180,19 +185,15 @@ class NQueensTUI:
             self.put(3 + index, 2, f"{label:12s} {self.fields[index]}",
                      curses.A_REVERSE if self.focus == index else 0, 35)
         self.put(7, 2, "SOLVERS", curses.A_BOLD)
-        self.put(7, 21, "SAT ENCODERS", curses.A_BOLD)
+        self.put(7, 21, "ENCODINGS", curses.A_BOLD)
         for index, name in enumerate(SOLVERS):
             self.put(8 + index, 2, f"[{'x' if name in self.solvers else ' '}] {name}",
                      curses.A_REVERSE if self.focus == 3 + index else 0, 18)
-        has_sat = any(solver in SAT_SOLVERS for solver in self.solvers)
-        for index, name in enumerate(ENCODINGS):
+        for index, name in enumerate(MODEL_ENCODINGS):
             style = curses.A_REVERSE if self.focus == 3 + len(SOLVERS) + index else 0
-            self.put(8 + index, 21, f"[{'x' if has_sat and name in self.encoders else ' '}] {name}",
-                     style if has_sat else style | curses.A_DIM, 17)
-        if not has_sat:
-            self.put(14, 21, "Direct models", curses.A_DIM, 17)
+            self.put(8 + index, 21, f"[{'x' if name in self.encoders else ' '}] {name}", style, 17)
         self.put(17, 2, "[ Run selected cases ]" if not self.busy else "[ Solving ... c cancels ]",
-                 curses.A_REVERSE if self.focus == 3 + len(SOLVERS) + len(ENCODINGS) else curses.A_BOLD, 35)
+                 curses.A_REVERSE if self.focus == 3 + len(SOLVERS) + len(MODEL_ENCODINGS) else curses.A_BOLD, 35)
         self.put(19, 2, "Type replaces; Backspace edits.", curses.A_DIM, 35)
         self.put(3, 41, f"RESULTS {len(self.results)}/{self.total}", curses.A_BOLD)
         if self.current:
@@ -230,14 +231,26 @@ class NQueensTUI:
         return 0
 
 
-def run_tui():
+def run_tui(log_dir=None):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("The TUI needs an interactive terminal. Use command-line flags or --help for scripts.", file=sys.stderr)
         return 2
     try:
-        return curses.wrapper(lambda screen: NQueensTUI(screen).run())
-    except curses.error as error:
-        print(f"Could not initialize the terminal UI: {error}", file=sys.stderr)
-        return 2
-    except KeyboardInterrupt:
-        return 130
+        return curses.wrapper(lambda screen: NQueensTUI(screen, log_dir=log_dir).run())
+    except BaseException as error:
+        if log_dir is not None:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            with (Path(log_dir) / "tui-errors.log").open("a") as stream:
+                traceback.print_exc(file=stream)
+        if isinstance(error, curses.error):
+            print(f"Could not initialize the terminal UI: {error}", file=sys.stderr)
+            return 2
+        if isinstance(error, KeyboardInterrupt):
+            return 130
+        raise
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log-dir", type=Path, help="Write live diagnostic logs for each case")
+    sys.exit(run_tui(log_dir=parser.parse_args().log_dir))

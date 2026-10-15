@@ -4,6 +4,7 @@ import importlib
 import json
 import signal
 import subprocess
+import sys
 from concurrent.futures import CancelledError
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from pysat.solvers import Glucose3
 
-from benchmark import BACKENDS, ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns
+from benchmark import BACKENDS, ENCODINGS, MODEL_ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns
 from solver.pySAT.Glucose import Glucose
 from solver.solver_interface import Solver, decode_board
 
@@ -23,8 +24,8 @@ class BenchmarkChecks(unittest.TestCase):
         process = Mock()
         process.communicate.side_effect = [KeyboardInterrupt, ("", "")]
         process.poll.return_value = None
-        with patch("benchmark.subprocess.Popen", return_value=process) as popen, \
-                patch("benchmark.os.killpg") as kill:
+        with patch("helper.subprocess.Popen", return_value=process) as popen, \
+                patch("helper.os.killpg") as kill:
             with self.assertRaises(KeyboardInterrupt):
                 run_case("binomial", 4, 10, 3072)
         kill.assert_called_once_with(process.pid, signal.SIGKILL)
@@ -59,9 +60,9 @@ class BenchmarkChecks(unittest.TestCase):
     def test_cancel_during_worker_launch(self) -> None:
         process = Mock()
         process.poll.return_value = None
-        with patch("benchmark.subprocess.Popen", return_value=process), \
-                patch("benchmark.os.killpg") as kill, \
-                patch("benchmark.signal.pthread_sigmask",
+        with patch("helper.subprocess.Popen", return_value=process), \
+                patch("helper.os.killpg") as kill, \
+                patch("helper.signal.pthread_sigmask",
                       side_effect=[set(), KeyboardInterrupt, set()]):
             with self.assertRaises(KeyboardInterrupt):
                 run_case("binomial", 4, 10, 3072)
@@ -74,7 +75,7 @@ class BenchmarkChecks(unittest.TestCase):
         started = {4: 0, 8: 0}
         completed = {4: 0, 8: 0}
         active = peak = 0
-        cases_per_n = len(SAT_SOLVERS) * len(ENCODINGS) + len(BACKENDS)
+        cases_per_n = len(SOLVERS) * len(ENCODINGS) + len(BACKENDS)
 
         def run(encoding, n, timeout, memory, solver, cancel):
             nonlocal active, peak
@@ -105,14 +106,17 @@ class BenchmarkChecks(unittest.TestCase):
             self.assertEqual(peak, 2)
             saved = json.loads((Path(directory) / "results.json").read_text())
             expected = {(n, solver, encoding) for n in (4, 8) for solver in SOLVERS
-                        for encoding in (ENCODINGS if solver in SAT_SOLVERS else ("native",))}
+                        for encoding in (ENCODINGS if solver in SAT_SOLVERS else MODEL_ENCODINGS)}
             self.assertEqual(len(saved["results"]), len(expected))
             self.assertEqual({(row["n"], row["solver"], row["encoding"])
                               for row in saved["results"]}, expected)
             self.assertEqual(saved["metadata"]["jobs"], 2)
+            self.assertEqual(saved["metadata"]["encodings"], list(MODEL_ENCODINGS))
             report = (Path(directory) / "REPORT.md").read_text()
             for solver in SOLVERS:
                 self.assertIn(f"### {solver}", report)
+            self.assertEqual(report.count("| N | " + " | ".join(MODEL_ENCODINGS) + " |"),
+                             len(BACKENDS))
             self.assertIn("| 4 | error |", report)
             self.assertIn("--jobs 2", report)
 
@@ -128,8 +132,8 @@ class BenchmarkChecks(unittest.TestCase):
             return "", ""
 
         process.communicate.side_effect = communicate
-        with patch("benchmark.subprocess.Popen", return_value=process), \
-                patch("benchmark.os.killpg") as kill:
+        with patch("helper.subprocess.Popen", return_value=process), \
+                patch("helper.os.killpg") as kill:
             with self.assertRaises(CancelledError):
                 run_case("binomial", 4, 10, 3072, cancel=cancel)
         kill.assert_called_once_with(process.pid, signal.SIGKILL)
@@ -138,7 +142,7 @@ class BenchmarkChecks(unittest.TestCase):
     def test_cancel_event_skips_worker_launch(self) -> None:
         cancel = Event()
         cancel.set()
-        with patch("benchmark.subprocess.Popen") as popen:
+        with patch("helper.subprocess.Popen") as popen:
             with self.assertRaises(CancelledError):
                 run_case("binomial", 4, 10, 3072, cancel=cancel)
         popen.assert_not_called()
@@ -146,17 +150,75 @@ class BenchmarkChecks(unittest.TestCase):
     def test_timeout_preserves_partial_result(self) -> None:
         process = Mock()
         process.poll.return_value = -9
-        process.communicate.return_value = ('{"phase": "loading", "generation_s": 0.5}\n', "")
-        with patch("benchmark.subprocess.Popen", return_value=process), \
-                patch("benchmark.os.killpg") as kill, \
-                patch("benchmark.time.perf_counter", side_effect=[0, 20, 20]), \
-                patch("benchmark.Path.read_text", side_effect=FileNotFoundError):
+        process.returncode = -9
+        process.communicate.return_value = ('{"phase": "loading", "generation_s": 0.5, "peak_rss_mib": 10}\n', "")
+        with patch("helper.subprocess.Popen", return_value=process), \
+                patch("helper.os.killpg") as kill, \
+                patch("helper.time.perf_counter", side_effect=[0, 20, 20]), \
+                patch("helper.Path.read_text", return_value="VmHWM:\t2048000 kB"):
             result = run_case("binomial", 4, 10, 3072, "cadical")
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["solver"], "cadical")
         self.assertEqual(result["generation_s"], 0.5)
         self.assertEqual(result["phase"], "loading")
+        self.assertEqual(result["peak_rss_mib"], 2000)
         kill.assert_called_once_with(process.pid, signal.SIGKILL)
+
+    def test_diagnostic_logs_and_unique_case_directories(self) -> None:
+        with TemporaryDirectory() as directory:
+            rows = [run_case("product", 4, 10, 512, log_dir=Path(directory)) for _ in range(2)]
+            self.assertNotEqual(rows[0]["log_dir"], rows[1]["log_dir"])
+            for row in rows:
+                self.assertEqual(row["status"], "sat")
+                self.assertEqual(row["returncode"], 0)
+                logs = Path(row["log_dir"])
+                output = [json.loads(line) for line in (logs / "stdout.jsonl").read_text().splitlines()]
+                self.assertEqual([entry["phase"] for entry in output],
+                                 ["generation", "loading", "solving", "complete", "complete"])
+                self.assertTrue(all("timestamp_utc" in entry and "peak_rss_mib" in entry
+                                    for entry in output))
+                events = [json.loads(line) for line in (logs / "state.jsonl").read_text().splitlines()]
+                self.assertEqual(events[0]["event"], "start")
+                self.assertEqual(events[-1]["event"], "finished")
+                self.assertEqual(events[-1]["phase"], "complete")
+                self.assertEqual(events[-1]["status"], "sat")
+                self.assertTrue(any(event["event"] == "memory" for event in events))
+                self.assertTrue((logs / "stderr.log").exists())
+
+    def test_diagnostics_preserve_native_crash_and_timeout(self) -> None:
+        popen = subprocess.Popen
+        for crash in (True, False):
+            with self.subTest(crash=crash), TemporaryDirectory() as directory:
+                script = (
+                    "import faulthandler, os, resource, signal, time\n"
+                    "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+                    "faulthandler.enable()\n"
+                    "faulthandler.register(signal.SIGUSR1, all_threads=True)\n"
+                    "print('{\"phase\": \"solving\", \"clauses\": 123}', flush=True)\n"
+                    + ("os.kill(os.getpid(), signal.SIGSEGV)\n" if crash else "time.sleep(60)\n")
+                )
+                def launch(command, **kwargs):
+                    return popen([sys.executable, "-c", script], **kwargs)
+
+                with patch("helper.subprocess.Popen", side_effect=launch):
+                    row = run_case("product", 256, 2, 512, log_dir=Path(directory))
+                logs = Path(row["log_dir"])
+                self.assertEqual(row["phase"], "solving")
+                self.assertEqual(row["clauses"], 123)
+                self.assertEqual(row["status"], "error" if crash else "timeout")
+                self.assertEqual(row["signal"], "SIGSEGV" if crash else "SIGKILL")
+                self.assertIn("<string>", (logs / "stderr.log").read_text())
+                self.assertIn('"phase": "solving"', (logs / "stdout.jsonl").read_text())
+                events = [json.loads(line) for line in (logs / "state.jsonl").read_text().splitlines()]
+                self.assertEqual(events[-1]["signal"], row["signal"])
+
+    def test_diagnostics_preserve_python_traceback(self) -> None:
+        with TemporaryDirectory() as directory:
+            row = run_case("missing_encoder", 256, 10, 512, log_dir=Path(directory))
+            self.assertEqual(row["status"], "error")
+            self.assertEqual(row["phase"], "generation")
+            self.assertIn("ModuleNotFoundError", row["error"])
+            self.assertIn("Traceback", (Path(row["log_dir"]) / "stderr.log").read_text())
 
     def test_invalid_cli_limits(self) -> None:
         for arguments in (["--jobs", "0"], ["--sizes", "1"],
