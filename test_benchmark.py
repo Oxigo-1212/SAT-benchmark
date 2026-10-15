@@ -8,13 +8,13 @@ import sys
 from concurrent.futures import CancelledError
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Barrier, Event, Lock
+from threading import Event, get_ident
 import unittest
 from unittest.mock import Mock, patch
 
 from pysat.solvers import Glucose3
 
-from benchmark import BACKENDS, ENCODINGS, MODEL_ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns
+from benchmark import BACKENDS, ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns
 from solver.pySAT.Glucose import Glucose
 from solver.solver_interface import Solver, decode_board
 
@@ -39,7 +39,7 @@ class BenchmarkChecks(unittest.TestCase):
             output = Path(directory)
             arguments = ["benchmark.py", "--sizes", "4", "8", "16",
                          "--encodings", "binomial", "--solvers", "glucose",
-                         "--jobs", "1", "--output", directory]
+                         "--output", directory]
             with patch("benchmark.sys.argv", arguments), patch("builtins.print"), \
                     patch("benchmark.run_case", side_effect=[completed, KeyboardInterrupt]) as run:
                 with self.assertRaises(SystemExit) as stopped:
@@ -69,56 +69,44 @@ class BenchmarkChecks(unittest.TestCase):
         kill.assert_called_once_with(process.pid, signal.SIGKILL)
         process.communicate.assert_called_once_with()
 
-    def test_parallel_matrix_and_size_barrier(self) -> None:
-        lock = Lock()
-        barriers = {n: Barrier(2) for n in (4, 8)}
-        started = {4: 0, 8: 0}
-        completed = {4: 0, 8: 0}
-        active = peak = 0
-        cases_per_n = len(SOLVERS) * len(ENCODINGS) + len(BACKENDS)
+    def test_sequential_matrix_and_case_order(self) -> None:
+        thread = get_ident()
+        calls = []
 
-        def run(encoding, n, timeout, memory, solver, cancel):
-            nonlocal active, peak
-            with lock:
-                if n == 8:
-                    self.assertEqual(completed[4], cases_per_n)
-                started[n] += 1
-                first_pair = started[n] <= 2
-                active += 1
-                peak = max(peak, active)
-            if first_pair:
-                barriers[n].wait(timeout=5)
-            with lock:
-                active -= 1
-                completed[n] += 1
+        def run(encoding, n, timeout, memory, solver):
+            self.assertEqual(get_ident(), thread)
+            calls.append((n, solver, encoding))
             return {"solver": solver, "encoding": encoding, "n": n,
                     "status": "error" if solver == "gurobi" and n == 4 else "sat",
                     "total_s": 0.1, "wall_s": 0.2}
 
         with TemporaryDirectory() as directory:
-            arguments = ["benchmark.py", "--sizes", "4", "8", "--jobs", "2",
+            arguments = ["benchmark.py", "--sizes", "4", "8",
                          "--output", directory]
             with patch("benchmark.sys.argv", arguments), patch("builtins.print"), \
                     patch("benchmark.run_case", side_effect=run):
                 with self.assertRaises(SystemExit) as stopped:
                     main()
             self.assertEqual(stopped.exception.code, 1)
-            self.assertEqual(peak, 2)
             saved = json.loads((Path(directory) / "results.json").read_text())
-            expected = {(n, solver, encoding) for n in (4, 8) for solver in SOLVERS
-                        for encoding in (ENCODINGS if solver in SAT_SOLVERS else MODEL_ENCODINGS)}
-            self.assertEqual(len(saved["results"]), len(expected))
-            self.assertEqual({(row["n"], row["solver"], row["encoding"])
-                              for row in saved["results"]}, expected)
-            self.assertEqual(saved["metadata"]["jobs"], 2)
-            self.assertEqual(saved["metadata"]["encodings"], list(MODEL_ENCODINGS))
+            expected = [(n, solver, encoding) for n in (4, 8) for solver in SOLVERS
+                        for encoding in (ENCODINGS if solver in SAT_SOLVERS else ["native"])]
+            self.assertEqual(calls, expected)
+            self.assertEqual([(row["n"], row["solver"], row["encoding"])
+                              for row in saved["results"]], expected)
+            self.assertNotIn("jobs", saved["metadata"])
+            self.assertEqual(saved["metadata"]["solver_threads"], 1)
+            self.assertEqual(saved["metadata"]["encodings"], list(ENCODINGS))
+            self.assertNotIn("--jobs", saved["metadata"]["command"])
             report = (Path(directory) / "REPORT.md").read_text()
             for solver in SOLVERS:
                 self.assertIn(f"### {solver}", report)
-            self.assertEqual(report.count("| N | " + " | ".join(MODEL_ENCODINGS) + " |"),
+            self.assertEqual(report.count("| N | native |"),
                              len(BACKENDS))
             self.assertIn("| 4 | error |", report)
-            self.assertIn("--jobs 2", report)
+            self.assertIn("run sequentially in fresh processes", report)
+            self.assertNotIn("parallel", report)
+            self.assertNotIn("--jobs", report)
 
     def test_cancel_event_kills_running_worker(self) -> None:
         cancel = Event()
@@ -221,7 +209,7 @@ class BenchmarkChecks(unittest.TestCase):
             self.assertIn("Traceback", (Path(row["log_dir"]) / "stderr.log").read_text())
 
     def test_invalid_cli_limits(self) -> None:
-        for arguments in (["--jobs", "0"], ["--sizes", "1"],
+        for arguments in (["--jobs", "1"], ["--jobs", "2"], ["--sizes", "1"],
                           ["--timeout", "nan"], ["--timeout", "inf"],
                           ["--memory-mib", "0"]):
             with self.subTest(arguments=arguments), \

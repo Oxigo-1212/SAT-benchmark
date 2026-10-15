@@ -37,6 +37,7 @@ class NativeResult(TypedDict):
     total_s: float
 
 
+REPOSITORY_URL = "https://github.com/Oxigo-1212/SAT-benchmark"
 ENCODINGS: tuple[str, ...] = ("binomial", "binary", "commander", "product", "sequential")
 SAT_SOLVERS = {
     "glucose": ("Glucose", "Glucose3"),
@@ -342,12 +343,11 @@ def save_results(directory: Path, metadata: dict[str, Any], results: list[dict[s
 def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[str, Any]]) -> None:
     lines = [
         "# N-Queens solver benchmark", "",
+        f"Source: [SAT-benchmark on GitHub]({REPOSITORY_URL}).", "",
         f"Run: {metadata['started_utc']}. Python {metadata['python']}; "
         f"python-sat {metadata['python_sat']}; {metadata['cpu']}.", "",
-        f"For each N, all selected solver cases run in fresh processes with up to "
-        f"{metadata['jobs']} parallel jobs. The next N starts after all cases finish. "
-        "Each solver uses one thread. Concurrent jobs compete for CPU and memory, "
-        "so these timings measure parallel throughput rather than isolated solver speed. "
+        "For each N, all selected solver cases run sequentially in fresh processes. "
+        "Each case finishes before the next starts, and each solver uses one thread. "
         "Timings are wall-clock seconds; there are no warmups or statistical repeats. "
         "Generation includes board variables and the full Python clause list. "
         "Loading uses the original clause-by-clause insertion. SAT total covers generation, "
