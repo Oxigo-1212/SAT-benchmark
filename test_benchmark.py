@@ -1,6 +1,8 @@
 """Small checks for repeated board sizes, UNSAT boards, and model validation."""
 
+import csv
 import importlib
+import itertools
 import json
 import signal
 import subprocess
@@ -15,11 +17,173 @@ from unittest.mock import Mock, patch
 from pysat.solvers import Glucose3
 
 from benchmark import BACKENDS, ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns
+from helper import ENCODING_IMPLEMENTATIONS, save_results, summarize_results
 from solver.pySAT.Glucose import Glucose
 from solver.solver_interface import Solver, decode_board
 
 
 class BenchmarkChecks(unittest.TestCase):
+    def test_library_encodings_match_board_constraints(self) -> None:
+        for encoding in ("binomial", "binary", "sequential"):
+            module = importlib.import_module(f"encoder.{encoding}")
+            for n in (1, 2, 3, 4, 5):
+                variables = module.generate_variables(n)
+                clauses = module.generate_clauses(n, variables)
+                with self.subTest(encoding=encoding, n=n), Glucose3(bootstrap_with=clauses) as solver:
+                    for columns in itertools.product(range(n), repeat=n):
+                        assumptions = [variable if columns[row] == col else -variable
+                                       for row, cells in enumerate(variables)
+                                       for col, variable in enumerate(cells)]
+                        self.assertEqual(solver.solve(assumptions=assumptions),
+                                         validate_columns(columns, n), columns)
+                    self.assertFalse(solver.solve(assumptions=[-v for row in variables for v in row]))
+                    if n > 1:
+                        self.assertFalse(solver.solve(assumptions=[v for row in variables for v in row]))
+                self.assertEqual(clauses, module.generate_clauses(n, variables))
+
+    def test_library_auxiliaries_reserve_sparse_board_ids(self) -> None:
+        variables = [[100 + 3 * (row * 4 + col) for col in range(4)] for row in range(4)]
+        for encoding in ("binary", "sequential"):
+            module = importlib.import_module(f"encoder.{encoding}")
+            clauses = module.generate_clauses(4, variables)
+            with self.subTest(encoding=encoding), Glucose3(bootstrap_with=clauses) as solver:
+                for columns in itertools.product(range(4), repeat=4):
+                    assumptions = [variable if columns[row] == col else -variable
+                                   for row, cells in enumerate(variables)
+                                   for col, variable in enumerate(cells)]
+                    self.assertEqual(solver.solve(assumptions=assumptions),
+                                     validate_columns(columns, 4), columns)
+
+    def test_summary_separates_outcomes_and_successful_timings(self) -> None:
+        rows = [dict(solver="cadical", encoding="product", n=8, status=status,
+                     solving_s=seconds, total_s=seconds + 1, peak_rss_mib=100 + seconds)
+                for status, seconds in (("sat", 1), ("sat", 3), ("sat", 5), ("unsat", 7),
+                                        ("timeout", 120), ("memory_limit", 50),
+                                        ("error", 60), ("invalid", 70), ("unknown", 80))]
+        summary, = summarize_results(rows, repeats=10)
+        self.assertEqual(summary["attempts"], 9)
+        self.assertEqual(summary["requested_attempts"], 10)
+        self.assertEqual(summary["solved"], 4)
+        self.assertAlmostEqual(summary["success_rate"], 4 / 9)
+        self.assertEqual(summary["sat"], 3)
+        for status in ("unsat", "timeout", "memory_limit", "error", "invalid", "unknown"):
+            self.assertEqual(summary[status], 1)
+        self.assertEqual(summary["solving_s_samples"], 4)
+        self.assertEqual(summary["solving_s_median"], 4)
+        self.assertEqual(summary["solving_s_iqr"], 3)
+        self.assertEqual(summary["solving_s_min"], 1)
+        self.assertEqual(summary["solving_s_max"], 7)
+        self.assertEqual(summary["peak_rss_mib_max"], 220)
+        self.assertEqual(summary["peak_rss_samples"], 9)
+
+    def test_exports_leave_missing_metrics_blank(self) -> None:
+        rows = [dict(solver="glucose", encoding="product", n=4, status="sat",
+                     repetition=1, solving_s=0, total_s=0, wall_s=0.1),
+                dict(solver="cadical", encoding="product", n=4, status="memory_limit")]
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            save_results(output, {"repeats": 3}, rows)
+            with (output / "summary.csv").open() as stream:
+                solved, oom = list(csv.DictReader(stream))
+            self.assertEqual(float(solved["solving_s_median"]), 0)
+            self.assertEqual(solved["solving_s_iqr"], "")
+            self.assertEqual(solved["generation_s_median"], "")
+            self.assertEqual(solved["peak_rss_mib_max"], "")
+            self.assertEqual(oom["solving_s_median"], "")
+            self.assertEqual(oom["success_rate"], "0.0")
+            with (output / "runs.csv").open() as stream:
+                first, second = list(csv.DictReader(stream))
+            self.assertEqual(first["clauses"], "")
+            self.assertEqual(second["solving_s"], "")
+            self.assertEqual(json.loads((output / "experiment.json").read_text())["completed_attempts"], 2)
+
+    def test_repetitions_and_experiment_directories(self) -> None:
+        calls = []
+
+        def run(encoding, n, timeout, memory, solver, *, log_dir, repetition):
+            self.assertTrue(log_dir.is_dir())
+            calls.append((repetition, n, solver, encoding))
+            return dict(solver=solver, encoding=encoding, n=n, repetition=repetition,
+                        status="sat", solving_s=repetition, total_s=repetition, wall_s=repetition)
+
+        with TemporaryDirectory() as directory:
+            arguments = ["benchmark.py", "--sizes", "4", "8", "--solvers", "glucose", "cp_sat",
+                         "--encodings", "product", "--repeats", "3", "--output", directory]
+            for _ in range(2):
+                with patch("benchmark.sys.argv", arguments), patch("builtins.print"), \
+                        patch("benchmark.run_case", side_effect=run):
+                    main()
+            experiments = list(Path(directory).iterdir())
+            self.assertEqual(len(experiments), 2)
+            expected = [(r, n, solver, "product" if solver == "glucose" else "native")
+                        for r in (1, 2, 3) for n in (4, 8) for solver in ("glucose", "cp_sat")]
+            self.assertEqual(calls, expected * 2)
+            for output in experiments:
+                metadata = json.loads((output / "experiment.json").read_text())
+                self.assertEqual(metadata["state"], "completed")
+                self.assertEqual(metadata["planned_attempts"], 12)
+                self.assertEqual(metadata["completed_attempts"], 12)
+                with (output / "summary.csv").open() as stream:
+                    summaries = list(csv.DictReader(stream))
+                self.assertEqual(len(summaries), 4)
+                self.assertTrue(all(row["attempts"] == "3" for row in summaries))
+                self.assertTrue(all(row["solving_s_median"] == "2" for row in summaries))
+                self.assertIn("3 / 3", (output / "report.md").read_text())
+
+    def test_native_allocation_failures_are_not_generic_errors(self) -> None:
+        for stderr, code, status in (("terminate: std::bad_alloc", -6, "memory_limit"),
+                                     ("kissat: out-of-memory reallocating", -6, "memory_limit"),
+                                     ("MemoryError", 1, "memory_limit"),
+                                     ("", -9, "error"), ("segmentation fault", -11, "error")):
+            with self.subTest(stderr=stderr, code=code):
+                process = Mock(returncode=code)
+                process.communicate.return_value = ('{"phase":"loading"}\n', stderr)
+                process.poll.return_value = code
+                with patch("helper.subprocess.Popen", return_value=process):
+                    row = run_case("product", 4, 10, 512)
+                self.assertEqual(row["status"], status)
+                self.assertEqual(row["phase"], "loading")
+                self.assertEqual(row["returncode"], code)
+
+    def test_native_oom_log_preserves_original_failure(self) -> None:
+        popen = subprocess.Popen
+        script = (
+            "import faulthandler, os, resource\n"
+            "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+            "faulthandler.enable()\n"
+            "print('{\"phase\":\"solving\"}', flush=True)\n"
+            "os.write(2, b\"terminate called: std::bad_alloc\\n\")\n"
+            "os.abort()\n"
+        )
+        with TemporaryDirectory() as directory:
+            def launch(command, **kwargs):
+                return popen([sys.executable, "-c", script], **kwargs)
+
+            with patch("helper.subprocess.Popen", side_effect=launch):
+                row = run_case("product", 4, 10, 512, log_dir=Path(directory), repetition=2)
+            self.assertEqual(row["status"], "memory_limit")
+            self.assertEqual(row["signal"], "SIGABRT")
+            self.assertEqual(row["phase"], "solving")
+            self.assertEqual(row["repetition"], 2)
+            self.assertNotIn("\n", row["error"])
+            log = Path(row["log_file"]).read_text()
+            self.assertIn("std::bad_alloc", log)
+            self.assertIn("SOLVER STDERR (raw)", log)
+            self.assertIn("Fatal Python error: Aborted", log)
+
+    def test_explicit_log_parent_can_equal_output_parent(self) -> None:
+        with TemporaryDirectory() as directory:
+            row = dict(solver="glucose", encoding="product", n=4,
+                       status="sat", total_s=0.1, wall_s=0.2)
+            arguments = ["benchmark.py", "--sizes", "4", "--solvers", "glucose",
+                         "--encodings", "product", "--output", directory, "--log-dir", directory]
+            with patch("benchmark.sys.argv", arguments), patch("builtins.print"), \
+                    patch("benchmark.run_case", return_value=row) as run:
+                main()
+            output, = Path(directory).iterdir()
+            self.assertEqual(run.call_args.kwargs["log_dir"], output / "logs")
+            self.assertTrue((output / "logs").is_dir())
+
     def test_cancel_kills_and_reaps_worker(self) -> None:
         process = Mock()
         process.communicate.side_effect = [KeyboardInterrupt, ("", "")]
@@ -46,13 +210,14 @@ class BenchmarkChecks(unittest.TestCase):
                     main()
             self.assertEqual(stopped.exception.code, 130)
             self.assertEqual(run.call_count, 2)
+            output = next(output.iterdir())
             saved = json.loads((output / "results.json").read_text())
             self.assertEqual(saved["results"], [completed])
             self.assertEqual(saved["metadata"]["stop_reason"], "Cancelled with Ctrl+C")
             self.assertEqual(saved["metadata"]["interrupted_cases"],
-                             [{"solver": "glucose", "encoding": "binomial", "n": 8}])
-            self.assertEqual(len((output / "results.csv").read_text().splitlines()), 2)
-            report = (output / "REPORT.md").read_text()
+                             [{"solver": "glucose", "encoding": "binomial", "n": 8, "repetition": 1}])
+            self.assertEqual(len((output / "runs.csv").read_text().splitlines()), 2)
+            report = (output / "report.md").read_text()
             self.assertIn("Cancelled with Ctrl+C", report)
             self.assertIn("| 8 | stopped |", report)
             self.assertIn("| 16 | not run |", report)
@@ -73,7 +238,7 @@ class BenchmarkChecks(unittest.TestCase):
         thread = get_ident()
         calls = []
 
-        def run(encoding, n, timeout, memory, solver):
+        def run(encoding, n, timeout, memory, solver, **kwargs):
             self.assertEqual(get_ident(), thread)
             calls.append((n, solver, encoding))
             return {"solver": solver, "encoding": encoding, "n": n,
@@ -88,7 +253,8 @@ class BenchmarkChecks(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     main()
             self.assertEqual(stopped.exception.code, 1)
-            saved = json.loads((Path(directory) / "results.json").read_text())
+            output = next(Path(directory).iterdir())
+            saved = json.loads((output / "results.json").read_text())
             expected = [(n, solver, encoding) for n in (4, 8) for solver in SOLVERS
                         for encoding in (ENCODINGS if solver in SAT_SOLVERS else ["native"])]
             self.assertEqual(calls, expected)
@@ -97,8 +263,10 @@ class BenchmarkChecks(unittest.TestCase):
             self.assertNotIn("jobs", saved["metadata"])
             self.assertEqual(saved["metadata"]["solver_threads"], 1)
             self.assertEqual(saved["metadata"]["encodings"], list(ENCODINGS))
+            self.assertEqual(saved["metadata"]["encoding_implementations"], ENCODING_IMPLEMENTATIONS)
+            self.assertIn("encoder/pysat_cardinality", saved["metadata"]["source_sha256"])
             self.assertNotIn("--jobs", saved["metadata"]["command"])
-            report = (Path(directory) / "REPORT.md").read_text()
+            report = (output / "report.md").read_text()
             for solver in SOLVERS:
                 self.assertIn(f"### {solver}", report)
             self.assertEqual(report.count("| N | native |"),
@@ -172,6 +340,14 @@ class BenchmarkChecks(unittest.TestCase):
                 self.assertEqual(events[-1]["status"], "sat")
                 self.assertTrue(any(event["event"] == "memory" for event in events))
                 self.assertTrue((logs / "stderr.log").exists())
+                readable = Path(row["log_file"]).read_text()
+                self.assertIn("PROGRESS", readable)
+                self.assertIn("GENERATION", readable)
+                self.assertIn("SOLVING", readable)
+                self.assertIn("Validation        : passed", readable)
+                self.assertEqual(row["repetition"], 1)
+                self.assertEqual(row["encoding_implementation"], "custom/product")
+                self.assertIn("Encoder source    : custom/product", readable)
 
     def test_diagnostics_preserve_native_crash_and_timeout(self) -> None:
         popen = subprocess.Popen
@@ -196,6 +372,8 @@ class BenchmarkChecks(unittest.TestCase):
                 self.assertEqual(row["status"], "error" if crash else "timeout")
                 self.assertEqual(row["signal"], "SIGSEGV" if crash else "SIGKILL")
                 self.assertIn("<string>", (logs / "stderr.log").read_text())
+                self.assertIn("<string>", Path(row["log_file"]).read_text())
+                self.assertIn(row["status"], Path(row["log_file"]).read_text())
                 self.assertIn('"phase": "solving"', (logs / "stdout.jsonl").read_text())
                 events = [json.loads(line) for line in (logs / "state.jsonl").read_text().splitlines()]
                 self.assertEqual(events[-1]["signal"], row["signal"])
@@ -211,7 +389,7 @@ class BenchmarkChecks(unittest.TestCase):
     def test_invalid_cli_limits(self) -> None:
         for arguments in (["--jobs", "1"], ["--jobs", "2"], ["--sizes", "1"],
                           ["--timeout", "nan"], ["--timeout", "inf"],
-                          ["--memory-mib", "0"]):
+                          ["--memory-mib", "0"], ["--repeats", "0"], ["--repeats", "-1"]):
             with self.subTest(arguments=arguments), \
                     patch("benchmark.sys.argv", ["benchmark.py", *arguments]), \
                     patch("benchmark.sys.stderr"):

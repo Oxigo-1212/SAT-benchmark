@@ -10,6 +10,7 @@ import platform
 import resource
 import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -39,6 +40,13 @@ class NativeResult(TypedDict):
 
 REPOSITORY_URL = "https://github.com/Oxigo-1212/SAT-benchmark"
 ENCODINGS: tuple[str, ...] = ("binomial", "binary", "commander", "product", "sequential")
+ENCODING_IMPLEMENTATIONS = {
+    "binomial": "pysat.card.CardEnc/pairwise",
+    "binary": "pysat.card.CardEnc/bitwise",
+    "commander": "custom/commander",
+    "product": "custom/product",
+    "sequential": "pysat.card.CardEnc/seqcounter",
+}
 SAT_SOLVERS = {
     "glucose": ("Glucose", "Glucose3"),
     "cadical": ("CaDiCaL", "Cadical300"),
@@ -50,10 +58,11 @@ NATIVE_MODULES = {"cplex_cp": "CPOptimizer", "cplex_mip": "CPLEX",
 BACKENDS = tuple(NATIVE_MODULES)
 SOLVERS = (*SAT_SOLVERS, *BACKENDS)
 FIELDS: tuple[str, ...] = (
-    "solver", "encoding", "n", "status", "phase", "generation_s", "loading_s",
+    "solver", "encoding", "encoding_implementation", "n", "repetition", "status", "phase",
+    "generation_s", "loading_s",
     "solving_s", "total_s", "wall_s", "clauses", "variables", "peak_rss_mib",
     "constraints", "version", "backend_status", "conflicts", "decisions", "propagations", "error",
-    "returncode", "signal", "log_dir",
+    "returncode", "signal", "log_dir", "log_file",
 )
 
 
@@ -103,7 +112,8 @@ def _binary_columns(values: Sequence[float], n: int) -> list[int]:
     return columns
 
 
-def solve_n_queens(n: int, backend: str, time_limit: float = 30, threads: int = 1) -> NativeResult:
+def solve_n_queens(n: int, backend: str, time_limit: float = 30, threads: int = 1,
+                   *, on_loaded=None) -> NativeResult:
     """Return status, zero-based queen columns, model size, and wall-clock timings.
 
     A time limit without a solution is distinct from proven infeasibility.
@@ -119,7 +129,8 @@ def solve_n_queens(n: int, backend: str, time_limit: float = 30, threads: int = 
         raise ValueError(f"Unknown backend: {backend}")
     name = NATIVE_MODULES[backend]
     module = importlib.import_module(f"solver.{name}.{name}")
-    result: NativeResult = module._solve_n_queens(n, time_limit, threads)
+    result: NativeResult = module._solve_n_queens(
+        n, time_limit, threads, **({"on_loaded": on_loaded} if on_loaded is not None else {}))
     if result["columns"] is not None and not validate_columns(result["columns"], n):
         raise RuntimeError(f"{backend} returned an invalid N-Queens solution")
     return result
@@ -138,11 +149,18 @@ def worker(encoding: str, n: int, memory_mib: int, solver_name: str = "glucose",
     limit = memory_mib * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
     result: dict[str, Any] = {"solver": solver_name, "encoding": encoding,
-                              "n": n, "phase": "generation"}
+                              "n": n, "phase": "generation", "encoding_implementation":
+                              ENCODING_IMPLEMENTATIONS.get(encoding, "unknown")
+                              if solver_name in SAT_SOLVERS else "native"}
     emit(result)
     try:
         if solver_name in BACKENDS:
-            native_result = solve_n_queens(n, solver_name, time_limit=timeout_s, threads=1)
+            def loaded(building_s: float) -> None:
+                result.update(generation_s=building_s, loading_s=0, phase="solving")
+                emit(result)
+
+            native_result = solve_n_queens(n, solver_name, time_limit=timeout_s,
+                                           threads=1, on_loaded=loaded)
             result.update(native_result, generation_s=native_result["building_s"],
                           loading_s=0, phase="complete")
             if native_result["columns"] is not None:
@@ -152,7 +170,7 @@ def worker(encoding: str, n: int, memory_mib: int, solver_name: str = "glucose",
         else:
             sat_worker(encoding, n, solver_name, result)
     except MemoryError:
-        traceback.print_exc()
+        os.write(2, b"MemoryError: address-space allocation failed\n")
         result.update(status="memory_limit", error="Address-space memory cap reached")
     except Exception as exc:
         traceback.print_exc()
@@ -204,18 +222,52 @@ def sat_worker(encoding: str, n: int, solver_name: str, result: dict[str, Any]) 
 
 def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
              solver_name: str = "glucose", cancel: Event | None = None,
-             log_dir: Path | None = None) -> dict[str, Any]:
+             log_dir: Path | None = None, repetition: int = 1) -> dict[str, Any]:
     if cancel is not None and cancel.is_set():
         raise CancelledError
     command = [sys.executable, str(Path(__file__).resolve().with_name("benchmark.py")), "--worker",
                encoding, str(n), str(memory_mib), solver_name, str(timeout_s)]
     started = time.perf_counter()
-    result: dict[str, Any] = {"solver": solver_name, "encoding": encoding, "n": n}
+    result: dict[str, Any] = {"solver": solver_name, "encoding": encoding, "n": n,
+                              "repetition": repetition, "phase": "startup",
+                              "encoding_implementation": ENCODING_IMPLEMENTATIONS.get(encoding, "unknown")
+                              if solver_name in SAT_SOLVERS else "native"}
     timed_out = False
     process = None
     logs = ExitStack()
     state_log = None
     case_dir = None
+    readable_log = checkpoint_stream = None
+    previous_phase = None
+
+    def checkpoint(data: dict[str, Any]) -> None:
+        nonlocal previous_phase
+        if "peak_rss_mib" in result and "peak_rss_mib" in data:
+            data["peak_rss_mib"] = max(result["peak_rss_mib"], data["peak_rss_mib"])
+        result.update(data)
+        phase = data.get("phase")
+        if readable_log is not None and phase is not None and phase != previous_phase:
+            details = " | ".join(f"{key}={data[key]}" for key in
+                                 ("status", "clauses", "variables") if key in data)
+            print(f"  {data.get('timestamp_utc', '')}  {phase.upper()}"
+                  f"{(' | ' + details) if details else ''}", file=readable_log, flush=True)
+            previous_phase = phase
+
+    def read_checkpoints() -> None:
+        if checkpoint_stream is None:
+            return
+        while True:
+            position = checkpoint_stream.tell()
+            line = checkpoint_stream.readline()
+            if not line.endswith("\n"):
+                checkpoint_stream.seek(position)
+                return
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                checkpoint(data)
 
     def log_event(event: str, **data: Any) -> None:
         if state_log is not None:
@@ -228,11 +280,26 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
         stdout = stderr = subprocess.PIPE
         if log_dir is not None:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
-            case_dir = Path(mkdtemp(prefix=f"{solver_name}-{encoding}-n{n}-", dir=log_dir))
+            case_dir = Path(mkdtemp(prefix=f"{solver_name}-{encoding}-n{n}-r{repetition:02d}-", dir=log_dir))
             stdout = logs.enter_context((case_dir / "stdout.jsonl").open("w"))
             stderr = logs.enter_context((case_dir / "stderr.log").open("w"))
+            checkpoint_stream = logs.enter_context((case_dir / "stdout.jsonl").open(errors="replace"))
             state_log = logs.enter_context((case_dir / "state.jsonl").open("w"))
+            readable_log = logs.enter_context((case_dir / "run.log").open("w"))
             result["log_dir"] = str(case_dir.resolve())
+            result["log_file"] = str((case_dir / "run.log").resolve())
+            print(f"RUN: {solver_name}_{encoding}_n{n}_r{repetition:02d}\n"
+                  + "=" * 72 + "\nINPUT\n"
+                  f"  Solver / encoding : {solver_name} / {encoding}\n"
+                  f"  Encoder source    : {result['encoding_implementation']}\n"
+                  f"  Board / repetition: {n} / {repetition}\n"
+                  f"  Started UTC       : {datetime.now(timezone.utc).isoformat()}\n"
+                  f"  Worker wall limit : {timeout_s:g} s (all phases)\n"
+                  f"  Address-space cap : {memory_mib} MiB (RLIMIT_AS)\n"
+                  "  Solver threads    : 1\n"
+                  "  Seed              : backend default; not explicitly configured\n"
+                  f"  Command           : {shlex.join(command)}\n\nPROGRESS",
+                  file=readable_log, flush=True)
             log_event("start", **result, command=command, timeout_s=timeout_s,
                       memory_mib=memory_mib, python=sys.version, platform=platform.platform())
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr,
@@ -244,6 +311,7 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
         next_sample = started
         try:
             while True:
+                read_checkpoints()
                 if cancel is not None and cancel.is_set():
                     raise CancelledError
                 remaining = timeout_s - (time.perf_counter() - started)
@@ -292,6 +360,9 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
             output, errors = process.communicate()
     except BaseException:
         log_event("interrupted", traceback=traceback.format_exc())
+        if readable_log is not None:
+            print("\nRESULT\n  Status: interrupted; worker cleanup requested",
+                  file=readable_log, flush=True)
         raise
     finally:
         if process is not None and process.poll() is None:
@@ -301,19 +372,18 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
                 pass
             process.communicate()
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        read_checkpoints()
         logs.close()
     if case_dir is not None:
         output = (case_dir / "stdout.jsonl").read_text(errors="replace")
         errors = (case_dir / "stderr.log").read_text(errors="replace")
-    for line in output.splitlines():
+    for line in (output.splitlines() if case_dir is None else []):
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue  # Native backends can print license or startup messages.
         if isinstance(data, dict):
-            if "peak_rss_mib" in result and "peak_rss_mib" in data:
-                data["peak_rss_mib"] = max(result["peak_rss_mib"], data["peak_rss_mib"])
-            result.update(data)
+            checkpoint(data)
     result["wall_s"] = time.perf_counter() - started
     result["returncode"] = process.returncode
     if process.returncode < 0:
@@ -321,60 +391,154 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
     if timed_out:
         result.update(status="timeout", error=f"Exceeded {timeout_s:g} s per-case wall limit")
     elif process.returncode:
-        result.update(status="error", error=f"Exit {process.returncode}: {errors.strip()}")
+        oom = any(marker in errors.lower() for marker in
+                  ("std::bad_alloc", "memoryerror", "out-of-memory", "out of memory"))
+        detail = "Allocation failure" if oom else "Worker failure"
+        first_line = next((line.strip() for line in errors.splitlines() if line.strip()), "")
+        result.update(status="memory_limit" if oom else "error",
+                      error=f"{detail}; exit {process.returncode}: {first_line[:500]}")
     elif "status" not in result:
         result.update(status="error", error="Worker exited without a result")
     if case_dir is not None:
         with (case_dir / "state.jsonl").open("a") as state_log:
             log_event("finished", **result)
+        with (case_dir / "run.log").open("a") as stream:
+            stream.write("\nRESULT\n")
+            for key in ("status", "phase", "version", "generation_s", "loading_s", "solving_s",
+                        "total_s", "wall_s", "peak_rss_mib", "clauses", "variables", "constraints",
+                        "conflicts", "decisions", "propagations", "returncode", "signal", "error"):
+                stream.write(f"  {key:18s}: {result.get(key, 'unavailable')}\n")
+            stream.write("  RSS scope         : Python worker only; excludes native child processes\n")
+            stream.write("  Validation        : " + ("passed" if result.get("status") == "sat"
+                         else "failed" if result.get("status") == "invalid" else "no SAT result") + "\n")
+            stream.write("\nSOLVER STDOUT (raw)\n" + "-" * 72 + "\n" + output)
+            stream.write("\nSOLVER STDERR (raw)\n" + "-" * 72 + "\n" + errors)
     return result
+
+
+SUCCESS_STATUSES = ("sat", "unsat")
+OUTCOMES = ("sat", "unsat", "timeout", "memory_limit", "error", "invalid", "unknown")
+TIMINGS = ("generation_s", "loading_s", "solving_s", "total_s", "wall_s")
+SUMMARY_FIELDS = (
+    "solver", "encoding", "n", "requested_attempts", "attempts", "solved", *OUTCOMES,
+    "success_rate", "peak_rss_samples", "peak_rss_mib_max",
+    *(f"{key}_{stat}" for key in TIMINGS
+      for stat in ("samples", "median", "q1", "q3", "iqr", "min", "max")),
+)
+
+
+def summarize_results(results: list[dict[str, Any]], repeats: int = 1) -> list[dict[str, Any]]:
+    """Summarize completed attempts; successful timings never include timeouts or errors."""
+    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    for row in results:
+        grouped.setdefault((row["solver"], row["encoding"], row["n"]), []).append(row)
+    summaries = []
+    for (solver, encoding, n), rows in grouped.items():
+        solved = [row for row in rows if row["status"] in SUCCESS_STATUSES]
+        summary = dict(solver=solver, encoding=encoding, n=n,
+                       requested_attempts=repeats, attempts=len(rows), solved=len(solved),
+                       success_rate=len(solved) / len(rows))
+        summary.update({status: sum(row["status"] == status for row in rows) for status in OUTCOMES})
+        summary["unknown"] += sum(row["status"] not in OUTCOMES for row in rows)
+        peaks = [row["peak_rss_mib"] for row in rows if row.get("peak_rss_mib") is not None]
+        summary["peak_rss_samples"] = len(peaks)
+        if peaks:
+            summary["peak_rss_mib_max"] = max(peaks)
+        for key in TIMINGS:
+            values = sorted(row[key] for row in solved if row.get(key) is not None)
+            summary[f"{key}_samples"] = len(values)
+            if values:
+                summary.update({f"{key}_median": statistics.median(values),
+                                f"{key}_min": min(values), f"{key}_max": max(values)})
+            if len(values) > 1:
+                q1, _, q3 = statistics.quantiles(values, n=4, method="inclusive")
+                summary.update({f"{key}_q1": q1, f"{key}_q3": q3, f"{key}_iqr": q3 - q1})
+        summaries.append(summary)
+    return summaries
 
 
 def save_results(directory: Path, metadata: dict[str, Any], results: list[dict[str, Any]]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
+    metadata["completed_attempts"] = len(results)
+    (directory / "experiment.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    # Retain full solutions and worker checkpoints outside the tabular exports.
     (directory / "results.json").write_text(
         json.dumps({"metadata": metadata, "results": results}, indent=2) + "\n")
-    with (directory / "results.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(results)
+    for filename, fields, rows in (
+        ("runs.csv", FIELDS, results),
+        ("summary.csv", SUMMARY_FIELDS, summarize_results(results, metadata.get("repeats", 1))),
+    ):
+        with (directory / filename).open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[str, Any]]) -> None:
+    def measurement(row: dict[str, Any], key: str) -> str:
+        value = row.get(key)
+        return f"{value:.4f}" if value is not None else "—"
+
+    summaries = summarize_results(results, metadata.get("repeats", 1))
     lines = [
         "# N-Queens solver benchmark", "",
         f"Source: [SAT-benchmark on GitHub]({REPOSITORY_URL}).", "",
-        f"Run: {metadata['started_utc']}. Python {metadata['python']}; "
-        f"python-sat {metadata['python_sat']}; {metadata['cpu']}.", "",
-        "For each N, all selected solver cases run sequentially in fresh processes. "
-        "Each case finishes before the next starts, and each solver uses one thread. "
-        "Timings are wall-clock seconds; there are no warmups or statistical repeats. "
-        "Generation includes board variables and the full Python clause list. "
-        "Loading uses the original clause-by-clause insertion. SAT total covers generation, "
-        "loading and solve (including model extraction), excluding imports, validation, and teardown. "
-        "Native backends run once per N using their direct models; generation is model "
-        "construction and loading is zero. Native total follows the existing backend "
-        "timings; Gurobi excludes license startup. Wall includes the entire worker process. "
-        "Peak RSS measures the Python worker on Linux and excludes CP Optimizer child memory.", "",
-        f"Limits: {metadata['timeout_s']:g} seconds wall time and "
-        f"{metadata['memory_mib']} MiB virtual address space per case. "
-        "A timeout or memory-limit result is an incomplete attempt, not an UNSAT result. "
-        "Partial timings cover only completed phases. No constructive solution, "
-        "symmetry constraints, solver tuning, or replacement encoding was used.", "",
-        "All SAT results are independently checked for exactly one queen per row and "
-        "column and no shared diagonals. Their 1-based queen columns are saved in results.json.", "",
-        "The original encodings are retained, including their existing grouping and "
-        "product matrix choices. The modules were made safe to import, board size and "
-        "auxiliary-variable state reset for each generation, and solvers closed explicitly.", "",
+        f"Experiment: {metadata['started_utc']} | State: {metadata.get('state', 'running')}.",
+        f"Python {metadata['python']}; python-sat {metadata['python_sat']}; {metadata['cpu']}.",
+        f"Code revision: {metadata.get('git_revision') or 'unavailable'}; "
+        f"tracked changes: {metadata.get('tracked_changes', 'unavailable')}.", "",
+        "All selected solver cases run sequentially in fresh processes. Each case finishes "
+        "before the next starts, and each solver uses one thread.",
+        f"Requested repetitions: {metadata.get('repeats', 1)} per case; "
+        f"completed attempts: {len(results)}/{metadata.get('planned_attempts', 'unavailable')}. "
+        "There are no warmups. Execution order is repetition, size, solver, encoding.",
+        f"Seeds: {metadata.get('seed_policy', 'backend defaults; not explicitly configured')}.", "",
+        "Encoding implementations: " + ("; ".join(
+            f"{name}: {implementation}" for name, implementation
+            in metadata.get("encoding_implementations", {}).items())
+            or "not applicable or unrecorded") + ".", "",
+        f"Limits: {metadata['timeout_s']:g} seconds for the entire worker, including imports, "
+        f"generation, loading, solving, validation and teardown; {metadata['memory_mib']} MiB "
+        "virtual address space (RLIMIT_AS). Allocation failures are OOM outcomes; their "
+        "messages alone do not distinguish the address-space cap from system exhaustion. "
+        "Unexplained signals remain errors.", "",
+        "Timings are wall-clock seconds. SAT generation builds the full Python clause list; "
+        "loading inserts clauses; solving includes model extraction. SAT total excludes imports, "
+        "validation and teardown. Native generation is model construction, loading is zero, "
+        "and total follows the backend timings (Gurobi excludes license startup). "
+        "Wall time covers the entire worker. A native phase checkpoint marks the start of solving.",
+        "Peak RSS measures the Python worker on Linux, excludes native child processes "
+        "such as CP Optimizer, and can miss peaks on abrupt crashes between samples.", "",
+        "SAT results are independently validated for one queen per row and column and no "
+        "shared diagonals. Solutions are retained in results.json. Missing measurements are "
+        "blank in CSV and shown as — here. Solver search counters are available only where "
+        "the backend exposes them. SAT encodings and native CP/MIP models are different formulations.", "",
+        "## Result summary", "",
+        "SAT/UNSAT/TO/OOM/ERR/INVALID/UNKNOWN counts include every finished attempt. "
+        "Success is validated SAT or expected UNSAT divided by finished attempts; pending or "
+        "interrupted attempts are excluded. Timing statistics use successful attempts only "
+        "and are conditional on success. Timeouts are never treated as solved times. "
+        "IQR = Q3 − Q1 using inclusive quartiles; unavailable with fewer than two timing samples. "
+        "Repeated default settings measure timing variability and do not establish independent "
+        "randomized search trials.", "",
+        "| Solver | Encoding | N | Attempts / requested | SAT / UNSAT / TO / OOM / ERR / INVALID / UNKNOWN | Success | Solve samples | Solve median [IQR] (s) | Solve min–max (s) | Max worker RSS (MiB) |",
+        "|---|---|---:|---:|---|---:|---:|---:|---:|---:|",
     ]
-    encodings = metadata["encodings"]
+    for row in summaries:
+        outcomes = " / ".join(str(row[status]) for status in OUTCOMES)
+        lines.append(f"| {row['solver']} | {row['encoding']} | {row['n']} | "
+                     f"{row['attempts']} / {row['requested_attempts']} | {outcomes} | "
+                     f"{row['success_rate']:.1%} | {row['solving_s_samples']} | "
+                     f"{measurement(row, 'solving_s_median')} [{measurement(row, 'solving_s_iqr')}] | "
+                     f"{measurement(row, 'solving_s_min')}–{measurement(row, 'solving_s_max')} | "
+                     f"{measurement(row, 'peak_rss_mib_max')} |")
     if metadata.get("stop_reason"):
-        lines += [f"Stopped: {metadata['stop_reason']}. Remaining cases were not run.", ""]
-    lines += ["## Comparison", "", "Cells show total seconds for validated SAT "
-              "results, or the stopping condition.", ""]
-    indexed = {(row["n"], row["solver"], row["encoding"]): row for row in results}
+        lines += ["", f"Stopped: {metadata['stop_reason']}. Remaining attempts were not run."]
+    lines += ["", "## Comparison", "", "Cells show median total seconds for successful attempts "
+              "and solved/attempted counts when repeated or mixed; otherwise the stopping condition.", ""]
+    indexed = {(row["n"], row["solver"], row["encoding"]): row for row in summaries}
     for solver in metadata["solvers"]:
-        columns = encodings if solver in SAT_SOLVERS else ["native"]
+        columns = metadata["encodings"] if solver in SAT_SOLVERS else ["native"]
         lines += [f"### {solver}", "", "| N | " + " | ".join(columns) + " |",
                   "|---:|" + "---:|" * len(columns)]
         for n in metadata["sizes"]:
@@ -382,24 +546,32 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
             for encoding in columns:
                 row = indexed.get((n, solver, encoding))
                 missing = "not run" if metadata.get("stop_reason") else "pending"
-                if {"n": n, "solver": solver, "encoding": encoding} in metadata.get("interrupted_cases", []):
-                    missing = "stopped"
-                cells.append(missing if row is None else
-                             f"{row['total_s']:.4f}" if row["status"] == "sat" else
-                             row["status"].replace("_", " "))
+                interrupted = any(case["n"] == n and case["solver"] == solver
+                                  and case["encoding"] == encoding
+                                  for case in metadata.get("interrupted_cases", []))
+                if row is None:
+                    cell = "stopped" if interrupted else missing
+                elif row["solved"]:
+                    cell = measurement(row, "total_s_median")
+                    if row["attempts"] > 1 or row["solved"] != row["attempts"]:
+                        cell += f" ({row['solved']}/{row['attempts']} solved)"
+                else:
+                    cell = ", ".join(status.replace("_", " ") for status in OUTCOMES if row[status])
+                if row is not None and row["attempts"] < metadata.get("repeats", 1):
+                    cell += "; incomplete"
+                cells.append(cell)
             lines.append(f"| {n} | " + " | ".join(cells) + " |")
         lines.append("")
-    lines += ["", "## Detailed measurements", "",
-              "| Solver | Encoding | N | Status | Generation (s) | Loading (s) | Solve (s) | Total (s) | Peak RSS (MiB) | Clauses | Constraints |",
-              "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"]
+    lines += ["## Individual attempts", "",
+              "| Solver | Encoding | N | Repeat | Status | Phase | Generation (s) | Loading (s) | Solve (s) | Total (s) | Wall (s) | Worker RSS (MiB) | Variables | Clauses | Constraints | Log |",
+              "|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for row in results:
-        def timing(key: str, measurement: dict[str, Any] = row) -> str:
-            return f"{measurement[key]:.4f}" if key in measurement else "—"
-        lines.append(f"| {row['solver']} | {row['encoding']} | {row['n']} | {row['status']} | "
-                     f"{timing('generation_s')} | {timing('loading_s')} | "
-                     f"{timing('solving_s')} | {timing('total_s')} | "
-                     f"{timing('peak_rss_mib')} | {row.get('clauses', '—')} | "
-                     f"{row.get('constraints', '—')} |")
-    lines += ["", "Reproduce:", "", "```sh",
-              shlex.join(metadata["command"]), "```", ""]
-    (directory / "REPORT.md").write_text("\n".join(lines))
+        log_file = row.get("log_file")
+        log_link = f"[log](<{os.path.relpath(log_file, directory)}>)" if log_file else "—"
+        cells = [str(row[key]) for key in ("solver", "encoding", "n")]
+        cells += [str(row.get("repetition", 1)), row["status"], row.get("phase", "startup")]
+        cells += [measurement(row, key) for key in (*TIMINGS, "peak_rss_mib")]
+        cells += [str(row.get(key, "—")) for key in ("variables", "clauses", "constraints")]
+        lines.append("| " + " | ".join([*cells, log_link]) + " |")
+    lines += ["", "Reproduce:", "", "```sh", shlex.join(metadata["command"]), "```", ""]
+    (directory / "report.md").write_text("\n".join(lines))
