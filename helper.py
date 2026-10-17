@@ -392,7 +392,8 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
         result.update(status="timeout", error=f"Exceeded {timeout_s:g} s per-case wall limit")
     elif process.returncode:
         oom = any(marker in errors.lower() for marker in
-                  ("std::bad_alloc", "memoryerror", "out-of-memory", "out of memory"))
+                  ("std::bad_alloc", "memoryerror", "out-of-memory", "out of memory",
+                   "cannot allocate memory"))
         detail = "Allocation failure" if oom else "Worker failure"
         first_line = next((line.strip() for line in errors.splitlines() if line.strip()), "")
         result.update(status="memory_limit" if oom else "error",

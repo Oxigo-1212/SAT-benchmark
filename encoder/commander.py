@@ -41,15 +41,9 @@ def binary_AMO(clauses: list[list[int]], variables: list[int]) -> None:
 
         binary_encoding(clauses, variables[i], temp_clause)
 
-def grouping_variables(variables: list[int], per_group: float) -> list[list[int]]:
-    groups = []
-    temp_groups = []
-    for i in range(len(variables)):
-        temp_groups.append(variables[i])
-        if((i + 1) % per_group == 0 or i == len(variables) - 1):
-            groups.append(temp_groups)
-            temp_groups = []
-    return groups
+def grouping_variables(variables: list[int], per_group: int) -> list[list[int]]:
+    return [variables[start:start + per_group]
+            for start in range(0, len(variables), per_group)]
 
 def generate_commanders(start: int, length: int) -> list[int]:
     return [i for i in range(start, start + length)]
@@ -70,7 +64,9 @@ def binomial_EO(clauses: list[list[int]], variables: list[int]) -> None:
 
 def at_most_one(clauses: list[list[int]], variables: list[int]) -> None:
         global new_variables_count
-        groups = grouping_variables(variables, board_size/math.floor(math.sqrt(board_size)))
+        group_count = math.isqrt(board_size)
+        per_group = (board_size + group_count - 1) // group_count
+        groups = grouping_variables(variables, per_group)
         commanders = generate_commanders(board_size ** 2 + new_variables_count + 1, len(groups))
         new_variables_count += len(groups)
         binomial_AMO(clauses, commanders)

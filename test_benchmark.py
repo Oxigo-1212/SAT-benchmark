@@ -23,8 +23,8 @@ from solver.solver_interface import Solver, decode_board
 
 
 class BenchmarkChecks(unittest.TestCase):
-    def test_library_encodings_match_board_constraints(self) -> None:
-        for encoding in ("binomial", "binary", "sequential"):
+    def test_cardinality_encodings_match_board_constraints(self) -> None:
+        for encoding in ("binomial", "binary", "sequential", "commander"):
             module = importlib.import_module(f"encoder.{encoding}")
             for n in (1, 2, 3, 4, 5):
                 variables = module.generate_variables(n)
@@ -40,6 +40,34 @@ class BenchmarkChecks(unittest.TestCase):
                     if n > 1:
                         self.assertFalse(solver.solve(assumptions=[v for row in variables for v in row]))
                 self.assertEqual(clauses, module.generate_clauses(n, variables))
+
+    def test_commander_grouping_preserves_inputs_and_boundaries(self) -> None:
+        from encoder.commander import grouping_variables
+
+        for size in (0, 1, 23, 24, 25, 512):
+            variables = list(range(1, size + 1))
+            with self.subTest(size=size):
+                groups = grouping_variables(variables, 24)
+                self.assertEqual([v for group in groups for v in group], variables)
+                self.assertTrue(all(0 < len(group) <= 24 for group in groups))
+                self.assertTrue(all(len(group) == 24 for group in groups[:-1]))
+
+    def test_commander_non_square_board_uses_multiple_groups(self) -> None:
+        from encoder import commander
+
+        clauses = []
+        with patch.object(commander, "board_size", 512, create=True), \
+                patch.object(commander, "new_variables_count", 0):
+            commander.at_most_one(clauses, list(range(1, 513)))
+            # 22 groups of at most 24 inputs, rather than one group of 512.
+            self.assertEqual(commander.new_variables_count, 130)
+            self.assertEqual(len(clauses), 3309)
+        with Glucose3(bootstrap_with=clauses) as solver:
+            self.assertTrue(solver.solve(assumptions=list(range(-512, 0))))
+            for variable in range(1, 513):
+                self.assertTrue(solver.solve(assumptions=[variable]), variable)
+            for pair in ((1, 2), (1, 24), (24, 25), (25, 48), (48, 49), (504, 505), (1, 512)):
+                self.assertFalse(solver.solve(assumptions=list(pair)), pair)
 
     def test_library_auxiliaries_reserve_sparse_board_ids(self) -> None:
         variables = [[100 + 3 * (row * 4 + col) for col in range(4)] for row in range(4)]
@@ -134,6 +162,8 @@ class BenchmarkChecks(unittest.TestCase):
         for stderr, code, status in (("terminate: std::bad_alloc", -6, "memory_limit"),
                                      ("kissat: out-of-memory reallocating", -6, "memory_limit"),
                                      ("MemoryError", 1, "memory_limit"),
+                                     ("cannot allocate memory for thread-local data: ABORT", 127, "memory_limit"),
+                                     ("error while loading shared libraries: missing.so", 127, "error"),
                                      ("", -9, "error"), ("segmentation fault", -11, "error")):
             with self.subTest(stderr=stderr, code=code):
                 process = Mock(returncode=code)
@@ -144,6 +174,36 @@ class BenchmarkChecks(unittest.TestCase):
                 self.assertEqual(row["status"], status)
                 self.assertEqual(row["phase"], "loading")
                 self.assertEqual(row["returncode"], code)
+
+    def test_loader_allocation_failure_preserves_phase_and_logs(self) -> None:
+        popen = subprocess.Popen
+        message = "cannot allocate memory for thread-local data: ABORT"
+        script = (
+            "import os\n"
+            "print('{\"phase\":\"loading\",\"generation_s\":28.649,\"clauses\":12560392}', flush=True)\n"
+            f"os.write(2, {message.encode()!r} + b'\\n')\n"
+            "os._exit(127)\n"
+        )
+        with TemporaryDirectory() as directory:
+            def launch(command, **kwargs):
+                return popen([sys.executable, "-c", script], **kwargs)
+
+            with patch("helper.subprocess.Popen", side_effect=launch):
+                row = run_case("sequential", 1024, 10, 3072, "cadical", log_dir=Path(directory))
+            self.assertEqual(row["status"], "memory_limit")
+            self.assertEqual(row["phase"], "loading")
+            self.assertEqual(row["returncode"], 127)
+            self.assertEqual(row["clauses"], 12560392)
+            self.assertEqual(row["generation_s"], 28.649)
+            self.assertNotIn("solving_s", row)
+            self.assertNotIn("signal", row)
+            self.assertIn(message, row["error"])
+            self.assertEqual((Path(row["log_dir"]) / "stderr.log").read_text(), message + "\n")
+            self.assertIn(message, Path(row["log_file"]).read_text())
+            summary, = summarize_results([row])
+            self.assertEqual(summary["memory_limit"], 1)
+            self.assertEqual(summary["error"], 0)
+            self.assertEqual(summary["solving_s_samples"], 0)
 
     def test_native_oom_log_preserves_original_failure(self) -> None:
         popen = subprocess.Popen
