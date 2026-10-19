@@ -2,7 +2,7 @@
 
 import time
 
-from helper import NativeResult, _binary_columns, _result
+from helper import NativeResult, SOLVER_SEEDS, _binary_columns, _result
 from solver.solver_interface import Clauses, cnf_variable_count
 
 
@@ -29,6 +29,7 @@ def _solve_n_queens(n: int, time_limit: float, threads: int,
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     solver.parameters.num_search_workers = threads
+    solver.parameters.random_seed = SOLVER_SEEDS["cp_sat"]
     loaded = time.perf_counter()
     if on_loaded is not None:
         on_loaded(loaded - started)

@@ -2,7 +2,7 @@
 
 import time
 
-from helper import NativeResult, _binary_columns, _result, board_lines
+from helper import NativeResult, SOLVER_SEEDS, _binary_columns, _result, board_lines
 from solver.solver_interface import Clauses, clause_to_linear, cnf_variable_count
 
 
@@ -17,6 +17,7 @@ def _solve_n_queens(n: int, time_limit: float, threads: int,
         model.set_warning_stream(None)
         model.parameters.threads.set(threads)
         model.parameters.timelimit.set(time_limit)
+        model.parameters.randomseed.set(SOLVER_SEEDS["cplex_mip"])
         variables = n * n if clauses is None else cnf_variable_count(clauses, n * n)
         model.variables.add(types="B" * variables)
         if clauses is None:

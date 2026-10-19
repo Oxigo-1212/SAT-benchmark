@@ -85,7 +85,9 @@ def exactly_one(clauses: list[list[int]], variables: list[int]) -> None:
     at_most_one(clauses, variables)
 
 
-def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
+def generate_clauses(n: int, variables: list[list[int]], formulation: str = "extended") -> list[list[int]]:
+    if formulation not in ("minimal", "extended"):
+        raise ValueError(f"Unknown formulation: {formulation}")
     global board_size, new_variables_count
     board_size = n
     new_variables_count = 0
@@ -95,9 +97,10 @@ def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
     for row in range(n):
         exactly_one(clauses, variables[row])
 
-    # Exactly one queen in each column
+    # Column ALO is redundant and omitted in the minimal formulation.
     for col in range(n):
-        exactly_one(clauses, [variables[row][col] for row in range(n)])
+        encode = exactly_one if formulation == "extended" else at_most_one
+        encode(clauses, [variables[row][col] for row in range(n)])
 
 
     # At most one queen in each diagonal

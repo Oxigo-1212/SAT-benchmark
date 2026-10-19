@@ -2,7 +2,7 @@
 
 import time
 
-from helper import NativeResult, _binary_columns, _result, board_lines
+from helper import NativeResult, SOLVER_SEEDS, _binary_columns, _result, board_lines
 from solver.solver_interface import Clauses, clause_to_linear, cnf_variable_count
 
 
@@ -16,6 +16,7 @@ def _solve_n_queens(n: int, time_limit: float, threads: int,
         with gp.Model("n_queens", env=environment) as model:
             model.Params.Threads = threads
             model.Params.TimeLimit = time_limit
+            model.Params.Seed = SOLVER_SEEDS["gurobi"]
             variables = n * n if clauses is None else cnf_variable_count(clauses, n * n)
             queens = [model.addVar(vtype=gp.GRB.BINARY) for _ in range(variables)]
             count = 0

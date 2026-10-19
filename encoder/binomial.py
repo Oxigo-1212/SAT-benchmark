@@ -6,8 +6,8 @@ from encoder.pysat_cardinality import generate_clauses as _generate_clauses, gen
 from solver.solver_interface import solve_cnf_board
 
 
-def generate_clauses(n: int, variables: list[list[int]]) -> list[list[int]]:
-    return _generate_clauses(n, variables, EncType.pairwise)
+def generate_clauses(n: int, variables: list[list[int]], formulation: str = "extended") -> list[list[int]]:
+    return _generate_clauses(n, variables, EncType.pairwise, formulation)
 
 
 def solve_n_queens(n: int, backend: str = "glucose") -> list[list[int]] | None:

@@ -6,14 +6,11 @@ import shutil
 import sys
 import time
 
-from helper import NativeResult, _binary_columns, _result
+from helper import NativeResult, SOLVER_SEEDS, _binary_columns, _result
 from solver.solver_interface import Clauses, cnf_variable_count
 
 
-def _solve_n_queens(n: int, time_limit: float, threads: int,
-                    clauses: Clauses | None = None, on_loaded=None) -> NativeResult:
-    from docplex.cp.model import CpoModel
-
+def find_executable() -> Path:
     executable = os.environ.get("CPO_EXECUTABLE") or shutil.which("cpoptimizer")
     if not executable:
         candidate = Path(sys.executable).parent / "cpoptimizer"
@@ -21,6 +18,14 @@ def _solve_n_queens(n: int, time_limit: float, threads: int,
             executable = str(candidate)
     if not executable:
         raise FileNotFoundError("Set CPO_EXECUTABLE to cpoptimizer or put it on PATH")
+    return Path(shutil.which(executable) or executable).resolve()
+
+
+def _solve_n_queens(n: int, time_limit: float, threads: int,
+                    clauses: Clauses | None = None, on_loaded=None) -> NativeResult:
+    from docplex.cp.model import CpoModel
+
+    executable = find_executable()
 
     started = time.perf_counter()
     model = CpoModel(name="n_queens")
@@ -38,8 +43,8 @@ def _solve_n_queens(n: int, time_limit: float, threads: int,
     loaded = time.perf_counter()
     if on_loaded is not None:
         on_loaded(loaded - started)
-    solution = model.solve(execfile=executable, TimeLimit=time_limit,
-                           Workers=threads, LogVerbosity="Quiet")
+    solution = model.solve(execfile=str(executable), TimeLimit=time_limit,
+                           Workers=threads, RandomSeed=SOLVER_SEEDS["cplex_cp"], LogVerbosity="Quiet")
     detail = solution.get_solve_status()
     columns = None
     if solution.is_solution():

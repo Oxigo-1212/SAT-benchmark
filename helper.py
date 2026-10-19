@@ -57,8 +57,9 @@ NATIVE_MODULES = {"cplex_cp": "CPOptimizer", "cplex_mip": "CPLEX",
                   "gurobi": "Gurobi", "cp_sat": "CPSAT"}
 BACKENDS = tuple(NATIVE_MODULES)
 SOLVERS = (*SAT_SOLVERS, *BACKENDS)
+SOLVER_SEEDS = {name: 0 if name in ("cadical", *BACKENDS) else None for name in SOLVERS}
 FIELDS: tuple[str, ...] = (
-    "solver", "encoding", "encoding_implementation", "n", "repetition", "status", "phase",
+    "solver", "encoding", "formulation", "encoding_implementation", "n", "repetition", "seed", "status", "phase",
     "generation_s", "loading_s",
     "solving_s", "total_s", "wall_s", "clauses", "variables", "peak_rss_mib",
     "constraints", "version", "backend_status", "conflicts", "decisions", "propagations", "error",
@@ -77,12 +78,14 @@ def validate_columns(columns: Sequence[int], n: int) -> bool:
     )
 
 
-def board_lines(n: int) -> Iterator[tuple[list[int], str]]:
+def board_lines(n: int, formulation: str = "extended") -> Iterator[tuple[list[int], str]]:
     """Yield flattened row/column equalities and nontrivial diagonal inequalities."""
+    if formulation not in ("minimal", "extended"):
+        raise ValueError(f"Unknown formulation: {formulation}")
     for row in range(n):
         yield [row * n + col for col in range(n)], "E"
     for col in range(n):
-        yield [row * n + col for row in range(n)], "E"
+        yield [row * n + col for row in range(n)], "E" if formulation == "extended" else "L"
     for direction in (-1, 1):
         diagonals: dict[int, list[int]] = {}
         for row in range(n):
@@ -143,13 +146,15 @@ def emit(data: dict[str, Any]) -> None:
 
 
 def worker(encoding: str, n: int, memory_mib: int, solver_name: str = "glucose",
-           timeout_s: float = 120) -> None:
+           timeout_s: float = 120, formulation: str = "extended") -> None:
     faulthandler.enable()
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     limit = memory_mib * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
     result: dict[str, Any] = {"solver": solver_name, "encoding": encoding,
-                              "n": n, "phase": "generation", "encoding_implementation":
+                              "formulation": formulation if solver_name in SAT_SOLVERS else "native",
+                              "n": n, "seed": SOLVER_SEEDS.get(solver_name),
+                              "phase": "generation", "encoding_implementation":
                               ENCODING_IMPLEMENTATIONS.get(encoding, "unknown")
                               if solver_name in SAT_SOLVERS else "native"}
     emit(result)
@@ -187,12 +192,14 @@ def sat_worker(encoding: str, n: int, solver_name: str, result: dict[str, Any]) 
     backend = getattr(importlib.import_module("pysat.solvers"), backend_name)
     started = time.perf_counter()
     variables = module.generate_variables(n)
-    clauses = module.generate_clauses(n, variables)
+    clauses = module.generate_clauses(n, variables, formulation=result.get("formulation", "extended"))
     result.update(generation_s=time.perf_counter() - started,
                   clauses=len(clauses), phase="loading")
     emit(result)
     loading = time.perf_counter()
     with backend() as native:
+        if solver_name == "cadical":
+            native.configure({"seed": SOLVER_SEEDS[solver_name]})
         solver = adapter(native)
         for clause in clauses:
             solver.add_clause(clause)
@@ -222,14 +229,19 @@ def sat_worker(encoding: str, n: int, solver_name: str, result: dict[str, Any]) 
 
 def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
              solver_name: str = "glucose", cancel: Event | None = None,
-             log_dir: Path | None = None, repetition: int = 1) -> dict[str, Any]:
+             log_dir: Path | None = None, repetition: int = 1,
+             formulation: str = "extended") -> dict[str, Any]:
+    if formulation not in ("minimal", "extended"):
+        raise ValueError(f"Unknown formulation: {formulation}")
     if cancel is not None and cancel.is_set():
         raise CancelledError
     command = [sys.executable, str(Path(__file__).resolve().with_name("benchmark.py")), "--worker",
-               encoding, str(n), str(memory_mib), solver_name, str(timeout_s)]
+               encoding, str(n), str(memory_mib), solver_name, str(timeout_s), formulation]
     started = time.perf_counter()
     result: dict[str, Any] = {"solver": solver_name, "encoding": encoding, "n": n,
-                              "repetition": repetition, "phase": "startup",
+                              "formulation": formulation if solver_name in SAT_SOLVERS else "native",
+                              "repetition": repetition, "seed": SOLVER_SEEDS.get(solver_name),
+                              "phase": "startup",
                               "encoding_implementation": ENCODING_IMPLEMENTATIONS.get(encoding, "unknown")
                               if solver_name in SAT_SOLVERS else "native"}
     timed_out = False
@@ -291,13 +303,14 @@ def run_case(encoding: str, n: int, timeout_s: float, memory_mib: int,
             print(f"RUN: {solver_name}_{encoding}_n{n}_r{repetition:02d}\n"
                   + "=" * 72 + "\nINPUT\n"
                   f"  Solver / encoding : {solver_name} / {encoding}\n"
+                  f"  Formulation       : {result['formulation']}\n"
                   f"  Encoder source    : {result['encoding_implementation']}\n"
                   f"  Board / repetition: {n} / {repetition}\n"
                   f"  Started UTC       : {datetime.now(timezone.utc).isoformat()}\n"
                   f"  Worker wall limit : {timeout_s:g} s (all phases)\n"
                   f"  Address-space cap : {memory_mib} MiB (RLIMIT_AS)\n"
                   "  Solver threads    : 1\n"
-                  "  Seed              : backend default; not explicitly configured\n"
+                  f"  Seed              : {result['seed'] if result['seed'] is not None else 'backend default; interface has no seed control'}\n"
                   f"  Command           : {shlex.join(command)}\n\nPROGRESS",
                   file=readable_log, flush=True)
             log_event("start", **result, command=command, timeout_s=timeout_s,
@@ -421,7 +434,7 @@ SUCCESS_STATUSES = ("sat", "unsat")
 OUTCOMES = ("sat", "unsat", "timeout", "memory_limit", "error", "invalid", "unknown")
 TIMINGS = ("generation_s", "loading_s", "solving_s", "total_s", "wall_s")
 SUMMARY_FIELDS = (
-    "solver", "encoding", "n", "requested_attempts", "attempts", "solved", *OUTCOMES,
+    "solver", "encoding", "formulation", "n", "requested_attempts", "attempts", "solved", *OUTCOMES,
     "success_rate", "peak_rss_samples", "peak_rss_mib_max",
     *(f"{key}_{stat}" for key in TIMINGS
       for stat in ("samples", "median", "q1", "q3", "iqr", "min", "max")),
@@ -430,13 +443,14 @@ SUMMARY_FIELDS = (
 
 def summarize_results(results: list[dict[str, Any]], repeats: int = 1) -> list[dict[str, Any]]:
     """Summarize completed attempts; successful timings never include timeouts or errors."""
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
     for row in results:
-        grouped.setdefault((row["solver"], row["encoding"], row["n"]), []).append(row)
+        formulation = row.get("formulation", "native" if row["encoding"] == "native" else "extended")
+        grouped.setdefault((row["solver"], row["encoding"], formulation, row["n"]), []).append(row)
     summaries = []
-    for (solver, encoding, n), rows in grouped.items():
+    for (solver, encoding, formulation, n), rows in grouped.items():
         solved = [row for row in rows if row["status"] in SUCCESS_STATUSES]
-        summary = dict(solver=solver, encoding=encoding, n=n,
+        summary = dict(solver=solver, encoding=encoding, formulation=formulation, n=n,
                        requested_attempts=repeats, attempts=len(rows), solved=len(solved),
                        success_rate=len(solved) / len(rows))
         summary.update({status: sum(row["status"] == status for row in rows) for status in OUTCOMES})
@@ -493,6 +507,7 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
         f"Requested repetitions: {metadata.get('repeats', 1)} per case; "
         f"completed attempts: {len(results)}/{metadata.get('planned_attempts', 'unavailable')}. "
         "There are no warmups. Execution order is repetition, size, solver, encoding.",
+        f"SAT formulation: {metadata.get('formulation', 'extended')}; native models are unchanged.",
         f"Seeds: {metadata.get('seed_policy', 'backend defaults; not explicitly configured')}.", "",
         "Encoding implementations: " + ("; ".join(
             f"{name}: {implementation}" for name, implementation
@@ -514,13 +529,24 @@ def write_report(directory: Path, metadata: dict[str, Any], results: list[dict[s
         "shared diagonals. Solutions are retained in results.json. Missing measurements are "
         "blank in CSV and shown as — here. Solver search counters are available only where "
         "the backend exposes them. SAT encodings and native CP/MIP models are different formulations.", "",
+    ]
+    if "source_snapshot" in metadata:
+        lines += [
+            "Reproduction files: [source snapshot](source/), "
+            "[installed packages](installed-packages.txt), and "
+            "[procedure](source/REPRODUCIBILITY.md). See experiment.json for per-solver seeds "
+            "and the source-file checksum manifest.", "",
+        ]
+    if metadata.get("repeats", 1) < 2:
+        lines += ["Only one attempt was requested per case; timing variability cannot be estimated.", ""]
+    lines += [
         "## Result summary", "",
         "SAT/UNSAT/TO/OOM/ERR/INVALID/UNKNOWN counts include every finished attempt. "
         "Success is validated SAT or expected UNSAT divided by finished attempts; pending or "
         "interrupted attempts are excluded. Timing statistics use successful attempts only "
         "and are conditional on success. Timeouts are never treated as solved times. "
         "IQR = Q3 − Q1 using inclusive quartiles; unavailable with fewer than two timing samples. "
-        "Repeated default settings measure timing variability and do not establish independent "
+        "Repeated fixed settings measure timing variability and do not establish independent "
         "randomized search trials.", "",
         "| Solver | Encoding | N | Attempts / requested | SAT / UNSAT / TO / OOM / ERR / INVALID / UNKNOWN | Success | Solve samples | Solve median [IQR] (s) | Solve min–max (s) | Max worker RSS (MiB) |",
         "|---|---|---:|---:|---|---:|---:|---:|---:|---:|",
