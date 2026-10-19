@@ -14,7 +14,7 @@ from typing import Any
 
 from helper import (
     BACKENDS, ENCODINGS, ENCODING_IMPLEMENTATIONS, FIELDS, NATIVE_MODULES,
-    REPOSITORY_URL, SAT_SOLVERS, SOLVERS,
+    REPOSITORY_URL, SAT_SOLVERS, SOLVERS, SOLVER_SEEDS,
     NativeResult, _binary_columns, _result, board_lines, emit, run_case,
     sat_worker, save_results, solve_n_queens, validate_columns, worker, write_report,
 )
@@ -24,13 +24,16 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         worker(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
                sys.argv[5] if len(sys.argv) > 5 else "glucose",
-               float(sys.argv[6]) if len(sys.argv) > 6 else 120)
+               float(sys.argv[6]) if len(sys.argv) > 6 else 120,
+               sys.argv[7] if len(sys.argv) > 7 else "extended")
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sizes", nargs="+", type=int,
                         default=[4, 8, 16, 32, 64, 128, 256, 512, 1024])
     parser.add_argument("--encodings", nargs="+", choices=ENCODINGS, default=ENCODINGS)
     parser.add_argument("--solvers", nargs="+", choices=SOLVERS, default=SOLVERS)
+    parser.add_argument("--formulation", choices=("minimal", "extended"), default="extended",
+                        help="SAT column constraints: AMO only or exactly one (default: extended)")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--memory-mib", type=int, default=3072)
     parser.add_argument("--repeats", type=int, default=1,
@@ -77,29 +80,36 @@ def main() -> None:
         "solver_threads": 1,
         "timeout_s": args.timeout, "memory_mib": args.memory_mib,
         "sizes": args.sizes, "encodings": list(args.encodings), "repeats": args.repeats,
+        "formulation": args.formulation,
         "encoding_implementations": {name: ENCODING_IMPLEMENTATIONS[name] for name in args.encodings}
         if any(solver in SAT_SOLVERS for solver in args.solvers) else {},
         "timeout_scope": "Entire worker: imports, generation, loading, solving, validation, teardown",
         "memory_limit_type": "RLIMIT_AS: virtual address space per worker",
         "rss_scope": "Python worker only; excludes native child processes; crash peaks may be sampled",
-        "seed_policy": "Backend defaults; seeds are not explicitly configured or varied",
+        "seed_policy": "Fixed seed 0 for CaDiCaL and native CP/MIP; backend defaults for "
+                       "Glucose, Kissat, CryptoMiniSat (no seed control in these PySAT interfaces); "
+                       "seeds are not varied between repetitions",
+        "solver_seeds": {name: SOLVER_SEEDS[name] for name in args.solvers},
         "log_dir": str(log_dir.resolve()),
         "planned_attempts": args.repeats * len(args.sizes) * sum(
             len(args.encodings) if solver in SAT_SOLVERS else 1 for solver in args.solvers),
-        "source_sha256": {name: hashlib.sha256((Path(__file__).resolve().parent /
-            (name + ".py")).read_bytes()).hexdigest() for name in [
-                *(f"encoder/{name}" for name in args.encodings),
-                *(["encoder/pysat_cardinality"] if any(
-                    name in args.encodings for name in ("binomial", "binary", "sequential")) else []),
-                *(f"solver/pySAT/{SAT_SOLVERS[name][0]}" for name in args.solvers if name in SAT_SOLVERS),
-                *(f"solver/{NATIVE_MODULES[name]}/{NATIVE_MODULES[name]}" for name in args.solvers if name in BACKENDS),
-                "solver/solver_interface", "helper", "benchmark"]},
         "command": [sys.executable, "benchmark.py", "--sizes", *map(str, args.sizes),
                     "--encodings", *args.encodings, "--solvers", *args.solvers,
+                    "--formulation", args.formulation,
                     "--timeout", str(args.timeout),
                     "--memory-mib", str(args.memory_mib), "--repeats", str(args.repeats),
                     "--output", str(args.output)],
     }
+    if "cplex_cp" in args.solvers:
+        from solver.CPOptimizer.CPOptimizer import find_executable
+
+        try:
+            executable = find_executable()
+            with executable.open("rb") as stream:
+                metadata["cp_optimizer_executable"] = {
+                    "path": str(executable), "sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+        except OSError as error:
+            metadata["cp_optimizer_executable"] = {"error": str(error)}
     results: list[dict[str, Any]] = []
     if args.log_dir is not None:
         metadata["command"] += ["--log-dir", str(args.log_dir)]
@@ -116,7 +126,8 @@ def main() -> None:
                         case = {"solver": solver, "encoding": encoding, "n": n,
                                 "repetition": repetition}
                         row = run_case(encoding, n, args.timeout, args.memory_mib, solver,
-                                       log_dir=log_dir, repetition=repetition)
+                                       log_dir=log_dir, repetition=repetition,
+                                       formulation=args.formulation)
                         results.append(row)
                         case = None
                         save_results(directory, metadata, results)

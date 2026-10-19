@@ -1,0 +1,16 @@
+# All backends; versions from the working Linux / CPython 3.14.0 environment. Commercial licenses are separate.
+python-sat==1.9.dev15
+six==1.17.0
+absl-py==2.5.0
+cplex==22.2.0.1
+docplex==2.32.264
+gurobipy==13.0.3
+immutabledict==4.3.1
+numpy==2.5.3
+ortools==9.15.6755
+pandas==3.0.6
+protobuf==6.33.6
+pycryptosat==5.11.21
+python-dateutil==2.9.0.post0
+typing_extensions==4.16.0
+

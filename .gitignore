@@ -1,2 +1,7 @@
 .idea/*
 __pycache__/
+.pytest_cache/
+# Experiment outputs stay local; the repo documents how to regenerate them.
+benchmark_results/
+remark_benchmark.md
+assets/

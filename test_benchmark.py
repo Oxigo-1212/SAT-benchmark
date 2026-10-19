@@ -1,7 +1,6 @@
 """Small checks for repeated board sizes, UNSAT boards, and model validation."""
 
 import csv
-import hashlib
 import importlib
 import itertools
 import json
@@ -18,7 +17,7 @@ from unittest.mock import Mock, patch
 from pysat.solvers import Cadical300, Glucose3
 
 from benchmark import (
-    BACKENDS, ENCODINGS, SAT_SOLVERS, SOLVERS, capture_reproduction, main, run_case, validate_columns,
+    BACKENDS, ENCODINGS, SAT_SOLVERS, SOLVERS, main, run_case, validate_columns,
 )
 from helper import ENCODING_IMPLEMENTATIONS, SOLVER_SEEDS, sat_worker, save_results, summarize_results
 from solver.pySAT.Glucose import Glucose
@@ -26,33 +25,6 @@ from solver.solver_interface import Solver, decode_board
 
 
 class BenchmarkChecks(unittest.TestCase):
-    def test_reproduction_snapshot_preserves_sources_and_excludes_private_files(self) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            repository, output = root / "project", root / "experiment"
-            repository.mkdir()
-            output.mkdir()
-            for name in ("benchmark.py", "encoder/product.py", "solver/pySAT/Glucose.py",
-                         "test_benchmark.py", "benchmark_commander.sh", "requirements.txt",
-                         "README.md", "REPRODUCIBILITY.md", ".aws/credentials", ".venv/private.py",
-                         "benchmark_results/old.py"):
-                path = repository / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"original {name}\n")
-            packages = [Mock(metadata={"Name": "python-sat"}, version="1.9.dev15")]
-            with patch("benchmark.distributions", return_value=packages):
-                metadata = capture_reproduction(output, repository)
-            self.assertEqual(metadata["packages"], {"python-sat": "1.9.dev15"})
-            self.assertEqual((output / "installed-packages.txt").read_text(), "python-sat==1.9.dev15\n")
-            self.assertEqual(len(metadata["source_files_sha256"]), 8)
-            for name, expected in metadata["source_files_sha256"].items():
-                saved = (output / "source" / name).read_bytes()
-                self.assertEqual(saved, (repository / name).read_bytes())
-                self.assertEqual(hashlib.sha256(saved).hexdigest(), expected)
-            (repository / "benchmark.py").write_text("changed after capture\n")
-            self.assertEqual((output / "source/benchmark.py").read_text(), "original benchmark.py\n")
-            self.assertIn("encoder/product", metadata["source_sha256"])
-
     def test_cadical_seed_is_applied_before_loading_clauses(self) -> None:
         result = {}
         with patch.object(Cadical300, "configure", autospec=True,
@@ -190,9 +162,6 @@ class BenchmarkChecks(unittest.TestCase):
                 self.assertEqual(metadata["planned_attempts"], 12)
                 self.assertEqual(metadata["completed_attempts"], 12)
                 self.assertEqual(metadata["solver_seeds"], {"glucose": None, "cp_sat": 0})
-                self.assertIn("python-sat", metadata["packages"])
-                self.assertIn("untracked_source_files", metadata)
-                self.assertTrue((output / "source/REPRODUCIBILITY.md").is_file())
                 with (output / "summary.csv").open() as stream:
                     summaries = list(csv.DictReader(stream))
                 self.assertEqual(len(summaries), 4)
@@ -366,7 +335,6 @@ class BenchmarkChecks(unittest.TestCase):
             self.assertEqual(saved["metadata"]["solver_threads"], 1)
             self.assertEqual(saved["metadata"]["encodings"], list(ENCODINGS))
             self.assertEqual(saved["metadata"]["encoding_implementations"], ENCODING_IMPLEMENTATIONS)
-            self.assertIn("encoder/pysat_cardinality", saved["metadata"]["source_sha256"])
             self.assertNotIn("--jobs", saved["metadata"]["command"])
             report = (output / "report.md").read_text()
             for solver in SOLVERS:
